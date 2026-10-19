@@ -7,8 +7,8 @@
     "registries": [
         {
             "kind": "git",
-            "repository": "https://gitlab.com/colorglass/vcpkg-colorglass",
-            "baseline": "6309841a1ce770409708a67a9ba5c26c537d2937",
+            "repository": "https://github.com/marthofdoom/vcpkg-registry",
+            "baseline": "5ae02e4fac9feb0964c5d0df12e94c04fd53657b",
             "packages": [
                 "commonlibsse-ng"
             ]
