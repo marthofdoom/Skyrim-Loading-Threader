@@ -240,8 +240,6 @@ namespace lt::probe::core
 		Acc n;
 		Acc ticks;
 		Acc ex;
-		Acc kern;  // kernel / user thread time (100 ns) across the call; only filled for the
-		Acc user;  // 13753 and 13784 E8 rows (call counts are small enough for a GetThreadTimes pair)
 	};
 
 	struct HeavyRow

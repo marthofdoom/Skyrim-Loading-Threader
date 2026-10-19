@@ -121,6 +121,7 @@ namespace lt::probe::core
 			std::vector<std::string>              cols;
 			std::vector<std::vector<std::string>> rows;
 			std::size_t                           textRows = static_cast<std::size_t>(-1);  // text shows at most this many; CSV all
+			bool                                  csvBlankNa = false;  // CSV writes "n/a" cells as empty
 			std::vector<std::string>              csvExtraCols;                           // CSV-only trailing columns
 			std::vector<std::vector<std::string>> csvExtra;                               // parallel to rows
 		};
@@ -193,7 +194,7 @@ namespace lt::probe::core
 				for (std::size_t r = 0; r < a_t.rows.size(); ++r) {
 					csv += CsvCell(episode);
 					for (const auto& cell : a_t.rows[r]) {
-						csv += "," + CsvCell(cell);
+						csv += "," + ((a_t.csvBlankNa && cell == "n/a") ? std::string() : CsvCell(cell));
 					}
 					if (r < a_t.csvExtra.size()) {
 						for (const auto& cell : a_t.csvExtra[r]) {
@@ -266,7 +267,7 @@ namespace lt::probe::core
 		};
 		struct CalleeSum
 		{
-			std::uint64_t n = 0, ticks = 0, ex = 0, kern = 0, user = 0;
+			std::uint64_t n = 0, ticks = 0, ex = 0;
 		};
 		struct SigSum
 		{
@@ -346,8 +347,6 @@ namespace lt::probe::core
 					m->callee[i].n += b.callee[i].n.get();
 					m->callee[i].ticks += b.callee[i].ticks.get();
 					m->callee[i].ex += b.callee[i].ex.get();
-					m->callee[i].kern += b.callee[i].kern.get();
-					m->callee[i].user += b.callee[i].user.get();
 				}
 				for (std::size_t i = 0; i < kVfCount; ++i) {
 					m->vf[i].n += b.vf[i].n.get();
@@ -660,7 +659,7 @@ namespace lt::probe::core
 						continue;
 					}
 					rows.push_back({ s.site.siteRva, std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex,
-						Ut(a_m.callee[i].kern), Ut(a_m.callee[i].user) });
+						"n/a", "n/a" });
 				}
 				// the three v1 direct callees, in code order with the rest
 				std::uint64_t plugins = a_m.startupSlotCount > 0 ? a_m.startupSlotCount - 1 : 0;
@@ -669,6 +668,7 @@ namespace lt::probe::core
 				std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.rva < b.rva; });
 				Table t;
 				t.name = "lf_callees";
+				t.csvBlankNa = true;
 				t.title = "13753 direct callees in code order (incl/excl ms; 'excl' for 13760 = its own bookkeeping outside the hooked callees):";
 				t.align = "rlrrrrrr";
 				t.cols = { "site_rva", "site -> callee", "calls", "incl_ms", "excl_ms", "kernel_ms", "user_ms", "pct_of_13753" };
@@ -679,6 +679,8 @@ namespace lt::probe::core
 				t.rows.push_back({ "-", "RESIDUAL unattributed (13753 inline code: loops, flag stores)", "-", F1(resid), F1(resid), "-", "-", F1(a_c.Pct(resid, lfMs)) });
 				t.rows.push_back({ "-", "13753 inclusive total", "1", F1(lfMs), F1(resid), "-", "-", "100.0" });
 				a_o.Tab(t);
+				a_o.Line("  NOTE: callee rows show wall time only (kernel/user n/a): they repeat per plugin file / per form, and a GetThreadTimes pair around each is costly and noisy under Wine; "
+						 "kernel/user is sampled only at segment and phase boundaries.");
 				if (!g_grp[kLfCallees].installed) {
 					a_o.Line("  NOTE: the lfCallees group is not installed, so the residual above includes every callee it would have named.");
 				}
@@ -718,7 +720,7 @@ namespace lt::probe::core
 					continue;
 				}
 				rows.push_back({ s.site.siteRva, "E8", std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex,
-					Ut(a_m.callee[i].kern), Ut(a_m.callee[i].user) });
+					"n/a", "n/a" });
 			}
 			for (std::size_t i = 0; i < kVfCount; ++i) {
 				const auto& s = sites::kVfSites[i];
@@ -730,6 +732,7 @@ namespace lt::probe::core
 			std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.rva < b.rva; });
 			Table t;
 			t.name = "ii_sites";
+			t.csvBlankNa = true;
 			t.title = a_startup ? "13784 callees (22 E8 + 6 virtual) and the WRLD/cell/ref virtual sites in code order (virtual rows are INCLUSIVE of recursive un-hooked inits):" :
 			                      "InitItem sites that fired in this episode (virtual rows are inclusive of recursive un-hooked inits):";
 			t.align = "rllrrrrr";
@@ -741,6 +744,7 @@ namespace lt::probe::core
 				t.rows.push_back({ "-", "-", "RESIDUAL unattributed (13784 inline code + the un-hooked 0x1BE2A2 vfunc)", "-", F1(iiMs), F1(a_c.Ms(a_m.initItemsEx)), "-", "-" });
 			}
 			a_o.Tab(t);
+			a_o.Line("  NOTE: callee rows show wall time only (kernel/user n/a); kernel/user is sampled only at phase boundaries (see ii_phases).");
 		}
 
 		void TypesSection(Out& a_o, const Merged& a_m, const Clk& a_c)
@@ -820,7 +824,7 @@ namespace lt::probe::core
 						S(p->bytes), S(p->compressed), nf != newByName.end() ? S(nf->second) : std::string("0"), F1(a_c.Pct(ms, a_c.Ms(all))) });
 				}
 				a_o.Tab(t);
-				a_o.Line("  NOTE: kernel/user time is recorded per phase, segment and 13753/13784 callee, NOT per signature (a GetThreadTimes pair around ~3M Load calls would distort them). "
+				a_o.Line("  NOTE: kernel/user time is recorded per phase and segment only, NOT per callee or signature (a GetThreadTimes pair around repeated calls would distort them). "
 						 "Load bodies run inside the 'plugin loop' segment: read its kernel_ms vs user_ms.");
 				if (a_m.sigOverflow != 0) {
 					a_o.Line(std::format("  WARNING: {} Load call(s) hit a full signature table and are not in the table.", a_m.sigOverflow));

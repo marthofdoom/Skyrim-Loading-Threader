@@ -625,20 +625,11 @@ namespace lt::probe
 				}
 			}
 
-			// kernel/user split per call: only where the call count is small (13753 and 13784 E8 rows)
-			constexpr bool kSplitCpu = (S.owner == sites::Owner::kLoadFiles || S.owner == sites::Owner::kInitPass);
-			CpuTimes       cpu0;
-			if constexpr (kSplitCpu) {
-				cpu0 = ThreadCpu();
-			}
+			// wall time only: kernel/user is sampled at the segment / phase markers (SetSeg / SetPhase),
+			// not per call (these rows repeat per plugin file / per form; GetThreadTimes is a wineserver call)
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
-			if constexpr (kSplitCpu) {
-				const CpuTimes cpu1 = ThreadCpu();
-				b->callee[I].kern.add(cpu1.kern >= cpu0.kern ? cpu1.kern - cpu0.kern : 0);
-				b->callee[I].user.add(cpu1.user >= cpu0.user ? cpu1.user - cpu0.user : 0);
-			}
 
 			if constexpr (S.owner == sites::Owner::kInitPass && S.segExit >= 0) {
 				SetPhase(*b, S.segExit);

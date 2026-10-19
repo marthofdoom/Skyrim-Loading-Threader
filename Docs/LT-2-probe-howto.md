@@ -112,10 +112,10 @@ open/close trigger. Runtime episodes are reported to the log and appended to the
 ## Reading the v2 blocks and the decision each feeds
 - **system / episode / groups**: cores, Wine/Proton detection, thread ids, wall vs process CPU (`cpu_over_wall`
   is the achieved parallelism), per-group probe cost. Feeds: can the numbers be trusted (cost) and what machine.
-- **kernel_ms / user_ms** (phases, LoadFiles segments, 13753/13784 callee rows): thread kernel and user time,
-  separately. The 'raw read' share only covers ReadData from the in-memory buffer, not syscalls; the Load bodies
+- **kernel_ms / user_ms** (phases and LoadFiles segments only; callee rows show wall time and 'n/a' here):
+  thread kernel and user time, sampled at the segment/phase markers, separately. The 'raw read' share only covers ReadData from the in-memory buffer, not syscalls; the Load bodies
   (inside the *plugin loop* segment) hold the kernel time. A high kernel share means syscall batching (read-ahead,
-  bigger reads) beats threading. Not recorded per signature (too many calls); per phase, segment and callee only.
+  bigger reads) beats threading. Not recorded per signature or callee (too many calls; GetThreadTimes is costly under Wine); per phase and segment only.
 - **lf_segments / lf_callees**: where 13753's non-plugin-loop time goes, ordered by code, with the 'RESIDUAL
   unattributed' row. Feeds: is pass-1 OpenTES or the BSA auto-load worth pre-opening on workers.
 - **ii_phases / ii_sites**: the 13784 pass split P0..P10 and its callees. Feeds: whether the core loop (P3) is big
