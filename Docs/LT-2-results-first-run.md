@@ -19,9 +19,14 @@ LoadFiles (13753) total: **117.3 s**, one thread (the same thread that later rec
 Counts: 1,343,279 records dispatched; 17,968,651 raw reads; each compressed record inflated exactly once.
 
 ## Conclusions
-1. **Decompress-ahead (the pure seam found in LT-1) is worthless here: inflate is 0.7%.** The probe's own decision
-   rule (< 5%) says do not build stage 2. File reading in general is ~2%, so I/O-side work (read-ahead, native I/O
-   backend) cannot help this list either.
+1. **Decompress-ahead (the pure seam found in LT-1) is worthless here: inflate is 0.7%.**
+   **CORRECTION (2026-10-19):** the original wording here also said that file reading in general is ~2% and that
+   I/O-side work cannot help. That was too strong. The 1.0% "raw read" figure is time inside `TESFile::ReadData`
+   (13991), which copies from the engine's in-memory block buffer; it does NOT include the read() syscalls that fill
+   that buffer. A separate project (usvfs read shim) measured that the same load is syscall-bound under Proton
+   (20k-110k tiny read() calls per second, 35-55% of the main thread's CPU in the kernel). The kernel time therefore
+   sits inside other buckets, most likely "Load bodies" and part of the per-plugin loop. Whether I/O-side work helps
+   is OPEN until the probe splits user and kernel time per phase (probe v2 does).
 2. **The time is in two serial CPU blocks:** Load bodies (37.6%) and the post-loop InitItem pass (34.6%), plus an
    unexplained 17.8%. Any real speedup must parallelize engine-state-mutating work.
 3. **Next questions:** (a) is the InitItem pass (13784) splittable (per form type / per form, are InitItem bodies

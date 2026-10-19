@@ -95,3 +95,64 @@ The report prints this verdict on its `DECISION:` line, or `UNPROVEN` if the inf
   refuses to install and says so. `bAllowPatchedGate=1` chains instead (LoadFiles ms then includes the wrapper).
 - If kDataLoaded arrives while LoadFiles is still running, the report is written when LoadFiles returns.
 - Timing uses `rdtsc`, calibrated against steady_clock over the window (invariant TSC assumed).
+
+
+# LT-2b (v0.2.0): episodes, phases, kernel/user, CSV, identity oracle
+
+Status: written 2026-10-19. **Not compiled yet** (CI is the only compiler). Sites: `Docs/LT-2b-sites-validated.md`.
+
+## Episodes
+An episode is a bounded loading event with its own tables. Episode 0 `startup` (label `launch`) is the startup
+LoadFiles. Every time the Loading Menu opens, `runtime-loadscreen-N` is opened and closed when the menu closes
+(read-only UI event sink); only hooked work that runs while it is open is attributed to it, on any thread, one
+block per thread. With no episode open each hook is a load, a branch and the original call. Labels
+(`[Episodes] sLabels`) are matched to episodes by order. New episode kinds are added by adding hook sites and an
+open/close trigger. Runtime episodes are reported to the log and appended to the CSV when they close.
+
+## Reading the v2 blocks and the decision each feeds
+- **system / episode / groups**: cores, Wine/Proton detection, thread ids, wall vs process CPU (`cpu_over_wall`
+  is the achieved parallelism), per-group probe cost. Feeds: can the numbers be trusted (cost) and what machine.
+- **kernel_ms / user_ms** (phases, LoadFiles segments, 13753/13784 callee rows): thread kernel and user time,
+  separately. The 'raw read' share only covers ReadData from the in-memory buffer, not syscalls; the Load bodies
+  (inside the *plugin loop* segment) hold the kernel time. A high kernel share means syscall batching (read-ahead,
+  bigger reads) beats threading. Not recorded per signature (too many calls); per phase, segment and callee only.
+- **lf_segments / lf_callees**: where 13753's non-plugin-loop time goes, ordered by code, with the 'RESIDUAL
+  unattributed' row. Feeds: is pass-1 OpenTES or the BSA auto-load worth pre-opening on workers.
+- **ii_phases / ii_sites**: the 13784 pass split P0..P10 and its callees. Feeds: whether the core loop (P3) is big
+  enough to parallelize, or P8/P9 (cells, refs) cap it. Empty arrays skip their marker (time lands in the previous phase).
+- **types**: per form type InitItem count, total, mean, max single form, log2 histogram (type = formType byte,
+  inclusive of recursive un-hooked inits). Feeds: which types are worth a parallel dispatcher.
+- **load_by_sig / heaviest_records / new_forms / composition / plugin_kinds**: Load bodies per record signature,
+  the 25 heaviest single records, forms created per type, record composition. Feeds: which record types and plugins
+  dominate Load.
+- **io_indicator**: raw-read ms per MB and pass-1 OpenTES ms per file: a warm/cold cache indicator. Compare runs.
+- **loop_split / files / plugins**: 13760 internals, per-file work in the file loop, per-plugin table.
+- **oracle**: the identity oracle (below).
+
+## Identity oracle
+At kDataLoaded (`[Oracle] bFormDigest=1`) on the main thread, read-only under the allForms read lock. Per form:
+FNV-1a-64 over formID (u32 LE), formType (u8), formFlags (u32 LE); the digests are summed mod 2^64
+(order-independent). Per formArray (types 0..0x89): FNV-1a-64 over the FormID sequence in array order
+(order-dependent), combined into one ordered digest. Printed as text and as one `LT-ORACLE v1 ...` line. A threaded
+loader is correct only if these match a serial run on the same load order.
+
+## CSV
+`LoadingThreader-v2.csv` next to the log (truncated at the startup report, appended per runtime episode). Sections
+start with `# section: <name>`, then a header row; the first column of every row is `episode`.
+
+## How to run the loading-episode test routine (human tester)
+1. Launch the game through the test instance (never a live play-through) and reach the main menu.
+2. Load a save (episode 1) and wait until you can move.
+3. Walk through one interior door (episode 2) and back out (episode 3).
+4. Fast travel once (episode 4).
+5. Quit normally. Collect `LoadingThreader.log` and `LoadingThreader-v2.csv` before the next launch.
+The report/CSV then contain `startup` plus the `runtime-loadscreen-N` episodes in that order (labels
+`saveload, door-in, door-out, fasttravel`). A loading screen that does not fit the routine just shifts the labels;
+check the episode wall times.
+
+## v2 notes
+- After the startup report the hooks stay live for runtime episodes (`bRuntimeLoadScreens=1`); with it off they
+  are idle pass-through as in v1.
+- A thread still inside a hook when its episode closes can add one last call after the runtime report is merged.
+- Trampoline reserve is 4 KiB.
+- `bAllowPatchedGate`, `bEnabled=0` and the version/VR refusal behave as in v1.

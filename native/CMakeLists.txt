@@ -1,4 +1,4 @@
-# LoadingThreader (LT-2 stage-1 timing probe). Structure copied from MSRF
+# LoadingThreader (LT-2b timing probe). Structure copied from MSRF
 # (marth-save-reload-fix/native), which copied MFO/MEO/MAO, which copied the
 # SkyrimDev/HelloWorld-using-CommonLibSSE-NG template. Doctrine: adapt working
 # sources, never write a build system from memory.
@@ -6,7 +6,7 @@
 # Deliberately minimal dependencies: CommonLibSSE-NG only (it brings spdlog).
 cmake_minimum_required(VERSION 3.21)
 
-project(LoadingThreader VERSION 0.1.0 LANGUAGES CXX)
+project(LoadingThreader VERSION 0.2.0 LANGUAGES CXX)
 
 find_package(CommonLibSSE CONFIG REQUIRED)
 
