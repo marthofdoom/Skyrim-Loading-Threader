@@ -1,0 +1,67 @@
+name: native
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native.yml"
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight build. Without this, several ~30 min
+# cold builds run in parallel racing to populate the same cache, and none of
+# them wins.
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      # SPLIT restore/save ON PURPOSE. The combined actions/cache action only
+      # saves in its post-step when the job SUCCEEDS -- so with a plain cache
+      # step, every compile error throws away the vcpkg build and the next run
+      # pays the full ~30 min cold cost again. Early development is mostly
+      # failed builds, so that is exactly backwards: the cache matters MOST
+      # when the build is broken. (Finding contributed by MFO.)
+      - name: Restore vcpkg cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+          restore-keys: vcpkg-
+
+      - name: Configure
+        run: cmake --preset release
+        env:
+          VCPKG_ROOT: C:\vcpkg
+
+      # Immediately after Configure (which is what actually builds the vcpkg
+      # dependencies) and BEFORE the compile that might fail. if: always() so a
+      # cancelled or failing job still banks the expensive artifacts.
+      - name: Save vcpkg cache
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ hashFiles('native/vcpkg.json', 'native/vcpkg-configuration.json') }}
+
+      - name: Build
+        run: cmake --build build/release
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoadingThreader-dll
+          path: |
+            native/build/release/LoadingThreader.dll
+            native/build/release/LoadingThreader.pdb
+          if-no-files-found: error

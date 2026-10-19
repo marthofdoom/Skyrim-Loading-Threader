@@ -1,0 +1,17 @@
+native/build/
+native/install/
+native/out/
+__pycache__/
+*.pyc
+*.zip
+*.log
+.vs/
+compile_commands.json
+
+# Game binaries and Address Library files are never committed.
+binaries/
+*.exe
+*.bin
+
+# agent worktrees
+.claude/worktrees/
