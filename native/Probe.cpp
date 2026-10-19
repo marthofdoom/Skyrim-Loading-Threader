@@ -871,14 +871,14 @@ namespace lt::probe
 			if (CheckFn(sites::kReadData, aReadData, why)) {
 				const auto* p = reinterpret_cast<const std::uint8_t*>(aReadData);
 				if (g_cfg.verbose) {
-					spdlog::info("[verify] ReadData prologue @RVA 0x{:X}: {}", sites::kReadData.rva, HexBytes(p, sites::kReadDataPrologue.size()));
+					spdlog::info("[verify] ReadData prologue @RVA 0x{:X}: {}", sites::kReadData.rva, HexBytes(p, sites::kReadDataPrologueLen));
 				}
-				if (std::memcmp(p, sites::kReadDataPrologue.data(), sites::kReadDataPrologue.size()) == 0) {
+				const auto found = sites::Fnv1a64(p, sites::kReadDataPrologueLen);
+				if (found == sites::kReadDataPrologueHash) {
 					doRawRead = true;
 				} else {
-					Refuse(kRawRead, std::format("ReadData prologue mismatch (another detour?): found {}, expected {}",
-										 HexBytes(p, sites::kReadDataPrologue.size()),
-										 HexBytes(sites::kReadDataPrologue.data(), sites::kReadDataPrologue.size())));
+					Refuse(kRawRead, std::format("ReadData prologue mismatch (another detour?): found {} (hash 0x{:016X}), expected hash 0x{:016X}",
+										 HexBytes(p, sites::kReadDataPrologueLen), found, sites::kReadDataPrologueHash));
 				}
 			} else {
 				Refuse(kRawRead, why);

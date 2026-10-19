@@ -132,16 +132,20 @@ namespace lt::sites
 	// detour. The first instruction is exactly 5 bytes and position-independent
 	// (`mov [rsp+10h], rbx`), so the stolen bytes are one whole instruction and
 	// the gateway is that instruction + an absolute jmp back to entry+5. The
-	// whole 16-byte prologue is compared at install (catches another detour).
-	inline constexpr std::array<std::uint8_t, 16> kReadDataPrologue{
-		0x48, 0x89, 0x5C, 0x24, 0x10,  // mov [rsp+10h], rbx   <- stolen (5)
-		0x55,                          // push rbp
-		0x56,                          // push rsi
-		0x57,                          // push rdi
-		0x41, 0x56,                    // push r14
-		0x41, 0x57,                    // push r15
-		0x48, 0x83, 0xEC, 0x40         // sub rsp, 40h
-	};
+	// whole 16-byte prologue is checked at install by FNV-1a 64-bit hash (catches
+	// another detour; no game bytes are stored in this repo). The stolen
+	// instruction itself is copied from the live process at install.
+	inline constexpr std::size_t kReadDataPrologueLen = 16;
+	inline constexpr std::uint64_t kReadDataPrologueHash = 0x46ede9c9b95d4a00ULL;
+	constexpr std::uint64_t Fnv1a64(const std::uint8_t* a_p, std::size_t a_n) noexcept
+	{
+		std::uint64_t h = 0xcbf29ce484222325ULL;
+		for (std::size_t i = 0; i < a_n; ++i) {
+			h ^= a_p[i];
+			h *= 0x100000001b3ULL;
+		}
+		return h;
+	}
 	inline constexpr std::size_t kReadDataStolen = 5;
 
 	static_assert(Consistent(kGateSite));
@@ -150,5 +154,5 @@ namespace lt::sites
 	static_assert(AllConsistent(kLoadFormSites));
 	static_assert(AllConsistent(kInflateSites));
 	static_assert(Consistent(kInitItemsSite));
-	static_assert(kReadDataStolen >= 5 && kReadDataStolen <= kReadDataPrologue.size());
+	static_assert(kReadDataStolen >= 5 && kReadDataStolen <= kReadDataPrologueLen);
 }

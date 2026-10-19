@@ -15,3 +15,9 @@ binaries/
 
 # agent worktrees
 .claude/worktrees/
+
+# decompiler / lifter output stays local (Skyrim-Recomp rule: nothing generated from the exe is committed)
+ghidra-projects/
+lifted/
+*.gpr
+*.rep/
