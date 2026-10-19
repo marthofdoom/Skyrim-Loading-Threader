@@ -71,6 +71,18 @@ namespace
 		spdlog::flush_every(std::chrono::seconds(1));
 	}
 
+	// ASCII rendering of a path for the log. NOT path::string(): MSVC's narrow conversion
+	// throws std::system_error for a character the ANSI code page cannot map, and an
+	// exception escaping SKSEPluginLoad takes the game down.
+	std::string AsciiPath(const std::filesystem::path& a_p)
+	{
+		std::string s;
+		for (const wchar_t c : a_p.native()) {
+			s += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+		}
+		return s;
+	}
+
 	// Wide read (the path may be non-ASCII); section/key names are ASCII literals.
 	long IniInt(const char* a_section, const char* a_key, long a_default)
 	{
@@ -153,7 +165,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	const auto      cfg = ReadConfig();
 	spdlog::info("[config] {} {}: bEnabled={} bVerboseLog={} bPerPlugin={} bRecord={} bLoadBody={} bRawRead={} "
 				 "bInflate={} bPostLoop={} bAllowPatchedGate={} iTopN={} bFullTable={}",
-		g_iniPath.string(), iniFound ? (g_iniBesideDll ? "found beside the DLL" : "found (relative fallback)") : "NOT FOUND (defaults)", cfg.enabled, cfg.verbose, cfg.perPlugin, cfg.record,
+		AsciiPath(g_iniPath), iniFound ? (g_iniBesideDll ? "found beside the DLL" : "found (relative fallback)") : "NOT FOUND (defaults)", cfg.enabled, cfg.verbose, cfg.perPlugin, cfg.record,
 		cfg.loadBody, cfg.rawRead, cfg.inflate, cfg.postLoop, cfg.allowPatchedGate, cfg.topN, cfg.fullTable);
 	spdlog::info("[config] v2: bLfCallees={} bInitPass={} bPerForm={} bInitRefs={} bLoopSplit={} bNewForms={} "
 				 "bRuntimeLoadScreens={} bFormDigest={} bCsv={}",

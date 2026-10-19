@@ -252,6 +252,13 @@ namespace lt::probe::core
 		std::atomic<const RE::TESFile*> file{ nullptr };
 	};
 
+	// Thread CPU time pair (declared before Block, which stores two of them).
+	struct CpuTimes
+	{
+		std::uint64_t kern = 0;  // 100 ns units
+		std::uint64_t user = 0;
+	};
+
 	struct PhaseRow
 	{
 		Acc wall;     // TSC ticks
@@ -385,18 +392,13 @@ namespace lt::probe::core
 	inline int (*g_getThreadTimes)(void*, FileTime*, FileTime*, FileTime*, FileTime*) = nullptr;
 	inline int (*g_getProcessTimes)(void*, FileTime*, FileTime*, FileTime*, FileTime*) = nullptr;
 
-	[[nodiscard]] inline std::uint32_t Tid() noexcept { return SKSE::WinAPI::GetCurrentThreadID(); }
+	// The MIT fork has no SKSE::WinAPI (that was the pre-fork NG API); REX::W32 is its Win32 layer.
+	[[nodiscard]] inline std::uint32_t Tid() noexcept { return REX::W32::GetCurrentThreadId(); }
 
 	[[nodiscard]] inline std::uint64_t Ft64(const FileTime& a_f) noexcept
 	{
 		return static_cast<std::uint64_t>(a_f.lo) | (static_cast<std::uint64_t>(a_f.hi) << 32);
 	}
-
-	struct CpuTimes
-	{
-		std::uint64_t kern = 0;  // 100 ns units
-		std::uint64_t user = 0;
-	};
 
 	// Calling thread's kernel and user time SEPARATELY, 100 ns units; zeros if unavailable.
 	[[nodiscard]] inline CpuTimes ThreadCpu() noexcept
