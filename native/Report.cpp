@@ -262,11 +262,11 @@ namespace lt::probe::core
 
 		struct PhaseSum
 		{
-			std::uint64_t wall = 0, cpu = 0, entries = 0;
+			std::uint64_t wall = 0, kern = 0, user = 0, entries = 0;
 		};
 		struct CalleeSum
 		{
-			std::uint64_t n = 0, ticks = 0, ex = 0;
+			std::uint64_t n = 0, ticks = 0, ex = 0, kern = 0, user = 0;
 		};
 		struct SigSum
 		{
@@ -332,18 +332,22 @@ namespace lt::probe::core
 				}
 				for (std::size_t i = 0; i < sites::kIiPhaseCount; ++i) {
 					m->ii[i].wall += b.ii[i].wall.get();
-					m->ii[i].cpu += b.ii[i].cpu.get();
+					m->ii[i].kern += b.ii[i].kern.get();
+					m->ii[i].user += b.ii[i].user.get();
 					m->ii[i].entries += b.ii[i].entries.get();
 				}
 				for (std::size_t i = 0; i < sites::kLfSegCount; ++i) {
 					m->lf[i].wall += b.lf[i].wall.get();
-					m->lf[i].cpu += b.lf[i].cpu.get();
+					m->lf[i].kern += b.lf[i].kern.get();
+					m->lf[i].user += b.lf[i].user.get();
 					m->lf[i].entries += b.lf[i].entries.get();
 				}
 				for (std::size_t i = 0; i < kTimedCount; ++i) {
 					m->callee[i].n += b.callee[i].n.get();
 					m->callee[i].ticks += b.callee[i].ticks.get();
 					m->callee[i].ex += b.callee[i].ex.get();
+					m->callee[i].kern += b.callee[i].kern.get();
+					m->callee[i].user += b.callee[i].user.get();
 				}
 				for (std::size_t i = 0; i < kVfCount; ++i) {
 					m->vf[i].n += b.vf[i].n.get();
@@ -403,6 +407,8 @@ namespace lt::probe::core
 			}
 			return m;
 		}
+
+		std::string Ut(std::uint64_t a_100ns) { return F1(static_cast<double>(a_100ns) / 10000.0); }
 
 		struct Clk
 		{
@@ -517,9 +523,9 @@ namespace lt::probe::core
 			Table t;
 			t.name = "episode";
 			t.title = "Episode:";
-			t.align = "llrrrrrrrrl";
-			t.cols = { "name", "kind", "wall_ms", "tsc_ticks_per_ms", "process_cpu_ms", "cpu_over_wall", "open_tid", "close_tid", "blocks", "block_pool_drops", "threads" };
-			t.rows.push_back({ a_e.name, a_e.startup ? "startup" : "runtime", F1(a_c.winMs), F1(a_c.tpm), F1(a_c.cpuMs),
+			t.align = "lllrrrrrrrrl";
+			t.cols = { "name", "label", "kind", "wall_ms", "tsc_ticks_per_ms", "process_cpu_ms", "cpu_over_wall", "open_tid", "close_tid", "blocks", "block_pool_drops", "threads" };
+			t.rows.push_back({ a_e.name, a_e.label.empty() ? std::string("-") : a_e.label, a_e.startup ? "startup" : "runtime", F1(a_c.winMs), F1(a_c.tpm), F1(a_c.cpuMs),
 				F2(a_c.winMs > 0.0 ? a_c.cpuMs / a_c.winMs : 0.0), S(a_e.openTid), S(a_e.closeTid), S(a_m.blocks), S(g_blockDrops.get()),
 				ThreadsOf(a_m) });
 			a_o.Tab(t);
@@ -627,13 +633,13 @@ namespace lt::probe::core
 				Table t;
 				t.name = "lf_segments";
 				t.title = "LoadFiles (13753) segments (monotonic markers; wall sums to the LoadFiles total):";
-				t.align = "lrrrrl";
-				t.cols = { "segment", "wall_ms", "cpu_ms", "pct_of_13753", "entries", "threads" };
+				t.align = "lrrrrrl";
+				t.cols = { "segment", "wall_ms", "kernel_ms", "user_ms", "pct_of_13753", "entries", "threads" };
 				std::uint64_t sum = 0;
 				for (std::size_t i = 0; i < sites::kLfSegCount; ++i) {
 					const auto& p = a_m.lf[i];
 					sum += p.wall;
-					t.rows.push_back({ kLfNames[i], F1(a_c.Ms(p.wall)), F1(static_cast<double>(p.cpu) / 10000.0),
+					t.rows.push_back({ kLfNames[i], F1(a_c.Ms(p.wall)), Ut(p.kern), Ut(p.user),
 						F1(a_c.Pct(a_c.Ms(p.wall), lfMs)), S(p.entries), TidList(g_lfTids[i]) });
 				}
 				a_o.Tab(t);
@@ -645,6 +651,7 @@ namespace lt::probe::core
 					std::uintptr_t rva;
 					std::string    name;
 					std::uint64_t  n, ticks, ex;
+					std::string    kern, user;
 				};
 				std::vector<Row> rows;
 				for (std::size_t i = 0; i < kTimedCount; ++i) {
@@ -652,24 +659,25 @@ namespace lt::probe::core
 					if (s.owner != sites::Owner::kLoadFiles) {
 						continue;
 					}
-					rows.push_back({ s.site.siteRva, std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex });
+					rows.push_back({ s.site.siteRva, std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex,
+						Ut(a_m.callee[i].kern), Ut(a_m.callee[i].user) });
 				}
 				// the three v1 direct callees, in code order with the rest
 				std::uint64_t plugins = a_m.startupSlotCount > 0 ? a_m.startupSlotCount - 1 : 0;
-				rows.push_back({ 0x1B9A03, "LF+0x323/+0x343 -> 13760 per-plugin loader (both sites)", plugins, a_m.tot.wall, a_m.tot.loopEx });
-				rows.push_back({ sites::kInitItemsSite.siteRva, "LF+0x363 -> 13784 InitItem pass", a_m.measured[kPostLoop], a_m.initItemsTicks, a_m.initItemsEx });
+				rows.push_back({ 0x1B9A03, "LF+0x323/+0x343 -> 13760 per-plugin loader (both sites)", plugins, a_m.tot.wall, a_m.tot.loopEx, "-", "-" });
+				rows.push_back({ sites::kInitItemsSite.siteRva, "LF+0x363 -> 13784 InitItem pass", a_m.measured[kPostLoop], a_m.initItemsTicks, a_m.initItemsEx, "-", "-" });
 				std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.rva < b.rva; });
 				Table t;
 				t.name = "lf_callees";
 				t.title = "13753 direct callees in code order (incl/excl ms; 'excl' for 13760 = its own bookkeeping outside the hooked callees):";
-				t.align = "rlrrrr";
-				t.cols = { "site_rva", "site -> callee", "calls", "incl_ms", "excl_ms", "pct_of_13753" };
+				t.align = "rlrrrrrr";
+				t.cols = { "site_rva", "site -> callee", "calls", "incl_ms", "excl_ms", "kernel_ms", "user_ms", "pct_of_13753" };
 				for (const auto& r : rows) {
-					t.rows.push_back({ std::format("0x{:X}", r.rva), r.name, S(r.n), F1(a_c.Ms(r.ticks)), F1(a_c.Ms(r.ex)), F1(a_c.Pct(a_c.Ms(r.ticks), lfMs)) });
+					t.rows.push_back({ std::format("0x{:X}", r.rva), r.name, S(r.n), F1(a_c.Ms(r.ticks)), F1(a_c.Ms(r.ex)), r.kern, r.user, F1(a_c.Pct(a_c.Ms(r.ticks), lfMs)) });
 				}
 				const double resid = a_c.Ms(a_m.loadFilesEx);
-				t.rows.push_back({ "-", "RESIDUAL unattributed (13753 inline code: loops, flag stores)", "-", F1(resid), F1(resid), F1(a_c.Pct(resid, lfMs)) });
-				t.rows.push_back({ "-", "13753 inclusive total", "1", F1(lfMs), F1(resid), "100.0" });
+				t.rows.push_back({ "-", "RESIDUAL unattributed (13753 inline code: loops, flag stores)", "-", F1(resid), F1(resid), "-", "-", F1(a_c.Pct(resid, lfMs)) });
+				t.rows.push_back({ "-", "13753 inclusive total", "1", F1(lfMs), F1(resid), "-", "-", "100.0" });
 				a_o.Tab(t);
 				if (!g_grp[kLfCallees].installed) {
 					a_o.Line("  NOTE: the lfCallees group is not installed, so the residual above includes every callee it would have named.");
@@ -684,13 +692,13 @@ namespace lt::probe::core
 				Table t;
 				t.name = "ii_phases";
 				t.title = "13784 InitItem pass phases P0..P10 (last-hit-wins markers; an empty array skips its marker and its time lands in the previous phase):";
-				t.align = "lrrrrl";
-				t.cols = { "phase", "wall_ms", "cpu_ms", "pct_of_13784", "entries", "threads" };
+				t.align = "lrrrrrl";
+				t.cols = { "phase", "wall_ms", "kernel_ms", "user_ms", "pct_of_13784", "entries", "threads" };
 				std::uint64_t sum = 0;
 				for (std::size_t i = 0; i < sites::kIiPhaseCount; ++i) {
 					const auto& p = a_m.ii[i];
 					sum += p.wall;
-					t.rows.push_back({ kIiNames[i], F1(a_c.Ms(p.wall)), F1(static_cast<double>(p.cpu) / 10000.0),
+					t.rows.push_back({ kIiNames[i], F1(a_c.Ms(p.wall)), Ut(p.kern), Ut(p.user),
 						F1(a_c.Pct(a_c.Ms(p.wall), iiMs)), S(p.entries), TidList(g_iiTids[i]) });
 				}
 				a_o.Tab(t);
@@ -701,6 +709,7 @@ namespace lt::probe::core
 				std::uintptr_t rva;
 				std::string    kind, name;
 				std::uint64_t  n, ticks, ex;
+				std::string    kern, user;
 			};
 			std::vector<Row> rows;
 			for (std::size_t i = 0; i < kTimedCount; ++i) {
@@ -708,27 +717,28 @@ namespace lt::probe::core
 				if (s.owner != sites::Owner::kInitPass || (!a_startup && a_m.callee[i].n == 0)) {
 					continue;
 				}
-				rows.push_back({ s.site.siteRva, "E8", std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex });
+				rows.push_back({ s.site.siteRva, "E8", std::format("{} -> {}", s.site.name, s.callee.name), a_m.callee[i].n, a_m.callee[i].ticks, a_m.callee[i].ex,
+					Ut(a_m.callee[i].kern), Ut(a_m.callee[i].user) });
 			}
 			for (std::size_t i = 0; i < kVfCount; ++i) {
 				const auto& s = sites::kVfSites[i];
 				if (!a_startup && a_m.vf[i].n == 0) {
 					continue;
 				}
-				rows.push_back({ s.site.siteRva, "vf", std::format("{} [{}]", s.site.name, kVfNames[i]), a_m.vf[i].n, a_m.vf[i].ticks, a_m.vf[i].ex });
+				rows.push_back({ s.site.siteRva, "vf", std::format("{} [{}]", s.site.name, kVfNames[i]), a_m.vf[i].n, a_m.vf[i].ticks, a_m.vf[i].ex, "-", "-" });
 			}
 			std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.rva < b.rva; });
 			Table t;
 			t.name = "ii_sites";
 			t.title = a_startup ? "13784 callees (22 E8 + 6 virtual) and the WRLD/cell/ref virtual sites in code order (virtual rows are INCLUSIVE of recursive un-hooked inits):" :
 			                      "InitItem sites that fired in this episode (virtual rows are inclusive of recursive un-hooked inits):";
-			t.align = "rllrrr";
-			t.cols = { "site_rva", "kind", "site", "calls", "incl_ms", "excl_ms" };
+			t.align = "rllrrrrr";
+			t.cols = { "site_rva", "kind", "site", "calls", "incl_ms", "excl_ms", "kernel_ms", "user_ms" };
 			for (const auto& r : rows) {
-				t.rows.push_back({ std::format("0x{:X}", r.rva), r.kind, r.name, S(r.n), F1(a_c.Ms(r.ticks)), F1(a_c.Ms(r.ex)) });
+				t.rows.push_back({ std::format("0x{:X}", r.rva), r.kind, r.name, S(r.n), F1(a_c.Ms(r.ticks)), F1(a_c.Ms(r.ex)), r.kern, r.user });
 			}
 			if (a_startup) {
-				t.rows.push_back({ "-", "-", "RESIDUAL unattributed (13784 inline code + the un-hooked 0x1BE2A2 vfunc)", "-", F1(iiMs), F1(a_c.Ms(a_m.initItemsEx)) });
+				t.rows.push_back({ "-", "-", "RESIDUAL unattributed (13784 inline code + the un-hooked 0x1BE2A2 vfunc)", "-", F1(iiMs), F1(a_c.Ms(a_m.initItemsEx)), "-", "-" });
 			}
 			a_o.Tab(t);
 		}
@@ -810,6 +820,8 @@ namespace lt::probe::core
 						S(p->bytes), S(p->compressed), nf != newByName.end() ? S(nf->second) : std::string("0"), F1(a_c.Pct(ms, a_c.Ms(all))) });
 				}
 				a_o.Tab(t);
+				a_o.Line("  NOTE: kernel/user time is recorded per phase, segment and 13753/13784 callee, NOT per signature (a GetThreadTimes pair around ~3M Load calls would distort them). "
+						 "Load bodies run inside the 'plugin loop' segment: read its kernel_ms vs user_ms.");
 				if (a_m.sigOverflow != 0) {
 					a_o.Line(std::format("  WARNING: {} Load call(s) hit a full signature table and are not in the table.", a_m.sigOverflow));
 				}

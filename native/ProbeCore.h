@@ -240,6 +240,8 @@ namespace lt::probe::core
 		Acc n;
 		Acc ticks;
 		Acc ex;
+		Acc kern;  // kernel / user thread time (100 ns) across the call; only filled for the
+		Acc user;  // 13753 and 13784 E8 rows (call counts are small enough for a GetThreadTimes pair)
 	};
 
 	struct HeavyRow
@@ -253,7 +255,8 @@ namespace lt::probe::core
 	struct PhaseRow
 	{
 		Acc wall;     // TSC ticks
-		Acc cpu;      // thread CPU time, 100 ns units (kernel + user), 0 if unavailable
+		Acc kern;     // thread KERNEL time, 100 ns units, 0 if unavailable
+		Acc user;     // thread USER time, 100 ns units, 0 if unavailable
 		Acc entries;  // how many times the phase was entered
 	};
 
@@ -275,7 +278,8 @@ namespace lt::probe::core
 		std::int8_t   iiPhase = -1;
 		std::int8_t   lfSeg = -1;
 		std::uint32_t avifHits = 0;
-		std::uint64_t iiStart = 0, iiCpuStart = 0, lfStart = 0, lfCpuStart = 0;
+		std::uint64_t iiStart = 0, lfStart = 0;
+		CpuTimes      iiCpu0, lfCpu0;
 		std::array<PhaseRow, sites::kIiPhaseCount> ii;
 		std::array<PhaseRow, sites::kLfSegCount>   lf;
 
@@ -313,6 +317,7 @@ namespace lt::probe::core
 		bool          startup = false;
 		std::string   name;
 		std::atomic<std::uint32_t> loadTid{ 0 };  // startup: the only measured thread
+		std::string   label;  // free text for matching the tester's routine to episodes by order (INI [Episodes] sLabels)
 		std::uint32_t openTid = 0, closeTid = 0;
 		std::chrono::steady_clock::time_point t0{}, t1{};
 		std::uint64_t tsc0 = 0, tsc1 = 0;
@@ -387,17 +392,26 @@ namespace lt::probe::core
 		return static_cast<std::uint64_t>(a_f.lo) | (static_cast<std::uint64_t>(a_f.hi) << 32);
 	}
 
-	// Calling thread's CPU time (kernel + user), 100 ns units; 0 if unavailable.
-	[[nodiscard]] inline std::uint64_t ThreadCpu() noexcept
+	struct CpuTimes
 	{
+		std::uint64_t kern = 0;  // 100 ns units
+		std::uint64_t user = 0;
+	};
+
+	// Calling thread's kernel and user time SEPARATELY, 100 ns units; zeros if unavailable.
+	[[nodiscard]] inline CpuTimes ThreadCpu() noexcept
+	{
+		CpuTimes r;
 		if (!g_getThreadTimes) {
-			return 0;
+			return r;
 		}
 		FileTime c{}, e{}, k{}, u{};
 		if (g_getThreadTimes(reinterpret_cast<void*>(static_cast<std::intptr_t>(-2)), &c, &e, &k, &u) == 0) {
-			return 0;
+			return r;
 		}
-		return Ft64(k) + Ft64(u);
+		r.kern = Ft64(k);
+		r.user = Ft64(u);
+		return r;
 	}
 
 	// Whole-process CPU time (kernel + user), 100 ns units; 0 if unavailable.

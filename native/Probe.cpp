@@ -174,15 +174,16 @@ namespace lt::probe
 				return;
 			}
 			const std::uint64_t now = __rdtsc();
-			const std::uint64_t cpu = ThreadCpu();
+			const CpuTimes cpu = ThreadCpu();
 			if (a_b.iiPhase >= 0) {
 				PhaseRow& r = a_b.ii[static_cast<std::size_t>(a_b.iiPhase)];
 				r.wall.add(now - a_b.iiStart);
-				r.cpu.add(cpu >= a_b.iiCpuStart ? cpu - a_b.iiCpuStart : 0);
+				r.kern.add(cpu.kern >= a_b.iiCpu0.kern ? cpu.kern - a_b.iiCpu0.kern : 0);
+				r.user.add(cpu.user >= a_b.iiCpu0.user ? cpu.user - a_b.iiCpu0.user : 0);
 			}
 			a_b.iiPhase = a_ph;
 			a_b.iiStart = now;
-			a_b.iiCpuStart = cpu;
+			a_b.iiCpu0 = cpu;
 			if (a_ph >= 0) {
 				a_b.ii[static_cast<std::size_t>(a_ph)].entries.add(1);
 				g_iiTids[static_cast<std::size_t>(a_ph)].note(Tid());
@@ -196,15 +197,16 @@ namespace lt::probe
 				return;
 			}
 			const std::uint64_t now = __rdtsc();
-			const std::uint64_t cpu = ThreadCpu();
+			const CpuTimes cpu = ThreadCpu();
 			if (a_b.lfSeg >= 0) {
 				PhaseRow& r = a_b.lf[static_cast<std::size_t>(a_b.lfSeg)];
 				r.wall.add(now - a_b.lfStart);
-				r.cpu.add(cpu >= a_b.lfCpuStart ? cpu - a_b.lfCpuStart : 0);
+				r.kern.add(cpu.kern >= a_b.lfCpu0.kern ? cpu.kern - a_b.lfCpu0.kern : 0);
+				r.user.add(cpu.user >= a_b.lfCpu0.user ? cpu.user - a_b.lfCpu0.user : 0);
 			}
 			a_b.lfSeg = a_seg;
 			a_b.lfStart = now;
-			a_b.lfCpuStart = cpu;
+			a_b.lfCpu0 = cpu;
 			if (a_seg >= 0) {
 				a_b.lf[static_cast<std::size_t>(a_seg)].entries.add(1);
 				g_lfTids[static_cast<std::size_t>(a_seg)].note(Tid());
@@ -623,9 +625,20 @@ namespace lt::probe
 				}
 			}
 
+			// kernel/user split per call: only where the call count is small (13753 and 13784 E8 rows)
+			constexpr bool kSplitCpu = (S.owner == sites::Owner::kLoadFiles || S.owner == sites::Owner::kInitPass);
+			CpuTimes       cpu0;
+			if constexpr (kSplitCpu) {
+				cpu0 = ThreadCpu();
+			}
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
+			if constexpr (kSplitCpu) {
+				const CpuTimes cpu1 = ThreadCpu();
+				b->callee[I].kern.add(cpu1.kern >= cpu0.kern ? cpu1.kern - cpu0.kern : 0);
+				b->callee[I].user.add(cpu1.user >= cpu0.user ? cpu1.user - cpu0.user : 0);
+			}
 
 			if constexpr (S.owner == sites::Owner::kInitPass && S.segExit >= 0) {
 				SetPhase(*b, S.segExit);
@@ -878,6 +891,32 @@ namespace lt::probe
 		// ---- runtime episodes: the Loading Menu -------------------------------------------
 		// READ-ONLY event sink on UI's MenuOpenCloseEvent source. It writes nothing into the
 		// engine and calls no engine function; it only opens/closes an episode.
+		// n-th comma-separated entry of [Episodes] sLabels (CSV/ASCII safe), or "" past the end.
+		std::string LabelFor(std::size_t a_n)
+		{
+			std::size_t start = 0, idx = 0;
+			const std::string& l = g_cfg.episodeLabels;
+			while (start <= l.size()) {
+				std::size_t end = l.find(',', start);
+				if (end == std::string::npos) {
+					end = l.size();
+				}
+				if (idx == a_n) {
+					std::string out;
+					for (std::size_t i = start; i < end; ++i) {
+						const auto c = static_cast<unsigned char>(l[i]);
+						if (c > 0x20 && c < 0x7F && c != '"') {
+							out += static_cast<char>(c);
+						}
+					}
+					return out;
+				}
+				++idx;
+				start = end + 1;
+			}
+			return std::string();
+		}
+
 		void OpenRuntimeEpisode()
 		{
 			if (!g_dataLoadedSeen.load()) {
@@ -896,6 +935,7 @@ namespace lt::probe
 			e.index = 1 + n;
 			e.startup = false;
 			e.name = std::format("runtime-loadscreen-{}", n + 1);
+			e.label = LabelFor(n);
 			e.openTid = Tid();
 			e.t0 = std::chrono::steady_clock::now();
 			e.tsc0 = __rdtsc();
@@ -1030,6 +1070,7 @@ namespace lt::probe
 		g_eps[0].index = 0;
 		g_eps[0].startup = true;
 		g_eps[0].name = "startup";
+		g_eps[0].label = "launch";
 		g_blocks = std::make_unique<Block[]>(kMaxBlocks);
 		g_slots = std::make_unique<Slot[]>(kMaxSlots);
 		g_files = std::make_unique<FileRow[]>(kFileRows);

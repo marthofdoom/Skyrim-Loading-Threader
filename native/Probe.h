@@ -3,6 +3,8 @@
 // LT-2 / LT-2b timing probe: PASSIVE. See Probe.cpp for the hook list and the
 // rules that keep it passive.
 
+#include <string>
+
 namespace lt::probe
 {
 	struct Config
@@ -29,6 +31,10 @@ namespace lt::probe
 		bool runtimeEpisodes = true;    // [Episodes] bRuntimeLoadScreens (Loading Menu open..close)
 		bool formDigest = true;         // [Oracle] bFormDigest (post-load identity digests at kDataLoaded)
 		bool csv = true;                // [Report] bCsv (LoadingThreader-v2.csv next to the log)
+
+		// [Episodes] sLabels: comma-separated free text; runtime episode n gets the n-th label (the
+		// startup episode is labelled "launch"), to match the tester's routine to episodes by order.
+		std::string episodeLabels = "saveload,door-in,door-out,fasttravel";
 
 		bool allowPatchedGate = false;  // [Advanced] bAllowPatchedGate
 		int  topN = 25;                 // [Report] iTopN
