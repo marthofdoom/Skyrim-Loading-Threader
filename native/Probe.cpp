@@ -1,38 +1,42 @@
 #include "PCH.h"
 
 #include "Probe.h"
+#include "ProbeCore.h"
 #include "Sites.h"
 
 // =============================================================================
-// LT-2 stage-1 timing probe (PASSIVE). SkyrimSE 1.6.1170.0 only.
+// LT-2 / LT-2b timing probe (PASSIVE). SkyrimSE 1.6.1170.0 only.
 //
-// What it answers: how the STARTUP data load (13753) splits between zlib
+// What it answers: how the startup data load (13753) splits between zlib
 // inflate (14032), raw subrecord reads (13991), the per-form Load bodies
 // (13690), the per-record dispatcher (13763), the per-plugin loop bookkeeping
-// (13760) and the post-loop InitItem pass (13784). See Docs/LT-2-probe-howto.md.
+// (13760) and the post-loop InitItem pass (13784) -- and, in v2, how each of
+// those splits further (13753's callees, 13784's phases P0..P10, the per-form-
+// type InitItem table, Load bodies per record signature) and what the same
+// hooked code costs while the Loading Menu is open at runtime.
+// See Docs/LT-2-probe-howto.md and Docs/LT-2b-sites-validated.md.
 //
 // Passivity rules (Linux-Native-Tools/hook-site-verification.md):
 //   * Every thunk calls the original with every argument register forwarded
 //     unchanged and returns rax unchanged. No field is written. No vfunc is
-//     called. Fields are only READ, and only through static_assert'ed offsets.
+//     called by the probe itself (the virtual-call thunks perform exactly the
+//     call the patched instruction made). Fields are only READ.
 //   * No allocation, no lock, no file I/O inside a hot thunk. Accumulators are
-//     preallocated at install and written by ONE thread (the load thread).
-//   * Hook choice: CALL-SITE write_call<5> wherever the call sites are few and
-//     verifiable (gate, 13760 x2, 13763 x1, 13690 x16, 14032 x3, 13784 x1).
-//     That is the family's proven technique (known-hooks.md) and it scopes the
-//     hook to the startup callers. The only ENTRY detour is 13991 ReadData,
-//     because it has ~900 direct callers (one per form-type Load); its 5 stolen
-//     bytes are one whole position-independent instruction (Sites.h).
-//   * Every site is re-verified at install (Address Library offset, E8 byte,
-//     rel32 target, or the full 16-byte prologue). Mismatch => that group is
-//     not installed and the log says why; the game is never crashed for it.
+//     preallocated at install and written by ONE thread each (thread-local
+//     blocks, ProbeCore.h).
+//   * Hook choice: CALL-SITE write_call<5> for E8 sites, write_call<6> for the
+//     6-byte virtual InitItem calls (the thunk reads the vtable slot at call
+//     time), one ENTRY detour (13991 ReadData, ~900 callers).
+//   * Every site is re-verified at install (Address Library offset, E8 byte and
+//     rel32 target, or the FNV-1a hash of the virtual-call window). Mismatch =>
+//     that group is not installed and the log says why; the game is never
+//     crashed for it.
 //
-// Gating: accumulation happens only between entry and exit of the 13753 call
-// made by the InitTES body (the one startup call; Sites.h), and only on the
-// thread that made that call. Calls from any other thread, before, during or
-// after the window, are passed straight through (and counted while the probe
-// is live). After the report every thunk is a pure pass-through ("unhook by
-// flag"); the patched bytes stay, which is the normal SKSE practice.
+// Gating: a thunk measures only while an EPISODE is open (g_curEp). Episode 0 is
+// the startup LoadFiles call made by the InitTES body (Sites.h gate), measured
+// on the thread that made that call only. Runtime episodes are the Loading Menu
+// open..close and measure on any thread. With no episode open every thunk is a
+// load + branch + the original call.
 // =============================================================================
 
 // Every field the thunks read, pinned to the offsets read off the 1.6.1170
@@ -42,6 +46,7 @@ static_assert(offsetof(RE::TESFile, currentform) == 0x284);                // [V
 static_assert(offsetof(RE::TESFile, fileOffset) == 0x2A8);                 // [I] diagnostic key only
 static_assert(offsetof(RE::TESFile, decompressedFormBuffer) == 0x4A0);     // [V] 14032 writes it at 0x1C991F
 static_assert(offsetof(RE::TESFile, decompressedFormBufferSize) == 0x4A8); // [V] 14032 writes it at 0x1C9926
+static_assert(offsetof(RE::FORM, form) == 0x0);                            // [I] record signature dword, read by the Load-body thunk
 static_assert(offsetof(RE::FORM, length) == 0x4);                          // [V] => +0x288, read by 14032
 static_assert(offsetof(RE::FORM, flags) == 0x8);                           // [V] => +0x28C, ReadData tests 0x40000
 static_assert(offsetof(RE::FORM, formID) == 0xC);                          // [V] => +0x290, read by 13760 R7
@@ -50,108 +55,7 @@ namespace lt::probe
 {
 	namespace
 	{
-		namespace sites = lt::sites;
-
-		using Fn4 = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
-		using Fn5 = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
-
-		constexpr std::uint32_t kCompressedFlag = 0x40000;  // record flag tested by ReadData at 0x1C8674
-
-		// ---- accumulators -------------------------------------------------------
-		// Single-writer: only the load thread writes (enforced by Enter()), so a
-		// plain load+store is exact, and the atomic type makes the report's
-		// cross-thread read well-defined. On x64 both compile to plain movs.
-		struct Acc
-		{
-			std::atomic<std::uint64_t> v{ 0 };
-			void add(std::uint64_t a_d) noexcept { v.store(v.load(std::memory_order_relaxed) + a_d, std::memory_order_relaxed); }
-			[[nodiscard]] std::uint64_t get() const noexcept { return v.load(std::memory_order_relaxed); }
-		};
-
-		// Multi-writer counter for the rare paths (foreign thread / outside window).
-		struct Ctr
-		{
-			std::atomic<std::uint64_t> v{ 0 };
-			void inc() noexcept { v.fetch_add(1, std::memory_order_relaxed); }
-			[[nodiscard]] std::uint64_t get() const noexcept { return v.load(std::memory_order_relaxed); }
-		};
-
-		// One slot per plugin, in load order. Slot 0 = work inside the gate but
-		// outside any 13760 call (pass 1 OpenTES, 13767, 13784, ...).
-		struct Slot
-		{
-			std::atomic<const RE::TESFile*> file{ nullptr };
-			Acc wall;        // 13760 inclusive ticks
-			Acc loopEx;      // 13760 exclusive ticks (OpenTES, seek/header, R7 editor-ID, progress, CloseTES)
-			Acc records;     // 13763 calls from the R6 site
-			Acc compressed;  // ... whose record header carried the compressed flag
-			Acc recEx;       // 13763 exclusive ticks
-			Acc loadN;
-			Acc loadEx;      // 13690 exclusive ticks (Load bodies minus nested reads/inflates)
-			Acc readN;
-			Acc readEx;      // 13991 exclusive ticks (minus nested inflate)
-			Acc inflN;
-			Acc inflEx;      // 14032 ticks (exclusive == inclusive unless something hooked nests in it)
-			Acc inflIn;      // compressed bytes (record data size, +0x288 before the call)
-			Acc inflOut;     // decompressed bytes (+0x4A8 after the call)
-		};
-
-		constexpr std::uint32_t kMaxSlots = 8192;  // > 254 full + 4096 light plugins
-
-		enum Group : std::size_t
-		{
-			kGate,
-			kPerPlugin,
-			kRecord,
-			kLoadBody,
-			kRawRead,
-			kInflate,
-			kPostLoop,
-			kGroupCount
-		};
-
-		constexpr std::array<const char*, kGroupCount> kGroupNames{
-			"gate      13753 LoadFiles (startup call)",
-			"perPlugin 13760 per-plugin loader",
-			"record    13763 per-record dispatcher",
-			"loadBody  13690 Load wrapper",
-			"rawRead   13991 TESFile::ReadData",
-			"inflate   14032 TESFile inflate",
-			"postLoop  13784 InitItem pass",
-		};
-
-		struct GroupState
-		{
-			bool        requested = false;
-			bool        installed = false;
-			std::size_t sites = 0;
-			std::string why;
-			Acc         measured;  // calls measured (load thread, inside the window)
-			Ctr         foreign;   // calls inside the window from another thread
-			Ctr         outside;   // calls outside the window, before the report
-		};
-
-		// ---- state machine ------------------------------------------------------
-		enum State : int
-		{
-			kIdle = 0,    // installed, startup LoadFiles not entered yet
-			kArming = 1,  // gate thunk is filling the window fields
-			kActive = 2,  // measuring
-			kClosed = 3,  // LoadFiles returned; data frozen
-			kDone = 4     // report written (or probe inactive): pure pass-through
-		};
-
-		std::atomic<int>           g_state{ kDone };  // kDone until Install succeeds
-		std::atomic<std::uint32_t> g_loadTid{ 0 };
-		std::atomic<bool>          g_dataLoadedSeen{ false };
-		std::atomic<bool>          g_reported{ false };
-		std::atomic<std::uint32_t> g_dataLoadedTid{ 0 };
-
-		Config     g_cfg{};
-		bool       g_gateInstalled = false;
-		bool       g_gateChained = false;
-		std::string g_inactiveWhy;
-		GroupState g_grp[kGroupCount];
+		using namespace core;
 
 		// Originals (set before the site is patched; the VERIFIED target).
 		std::uintptr_t g_origLoadFiles = 0;
@@ -161,53 +65,84 @@ namespace lt::probe
 		std::uintptr_t g_origReadData = 0;  // the gateway (stolen bytes + jmp back)
 		std::uintptr_t g_origInflate = 0;
 		std::uintptr_t g_origInitItems = 0;
+		std::array<std::uintptr_t, kTimedCount> g_timedOrig{};  // the verified callee of each kTimedSites row
 
-		// Load-thread-only working state (touched only after Enter() == measure).
-		std::unique_ptr<Slot[]> g_slots;
-		std::atomic<std::uint32_t> g_slotCount{ 1 };
-		std::uint32_t g_cur = 0;     // current slot
-		std::uint64_t g_child = 0;   // ticks spent in hooked children of the current scope
-
-		// Window timing (written by the load thread before the kClosed store).
-		std::uint64_t                         g_tsc0 = 0;
-		std::uint64_t                         g_tsc1 = 0;
-		std::chrono::steady_clock::time_point g_t0{};
-		std::chrono::steady_clock::time_point g_t1{};
-		Acc                                   g_loadFilesTicks;  // 13753 inclusive
-		Acc                                   g_loadFilesEx;     // 13753 exclusive
-		Acc                                   g_initItemsTicks;  // 13784 inclusive
-		Acc                                   g_initItemsEx;     // 13784 exclusive
-		Acc                                   g_slotOverflow;
-
-		// Inflate diagnostics (LT-1 section 7 item 2).
-		std::array<Acc, sites::kInflateSites.size()> g_inflBySite;
-		Acc                                          g_inflPreset;       // entered with +0x4A0 already non-null
-		Acc                                          g_inflRepeat;       // same (file, fileOffset, formID) as the previous inflate
-		Acc                                          g_inflForeignFile;  // file != the current plugin's file
-		Acc                                          g_inflNullFile;
-		Acc                                          g_inflFailed;       // +0x4A0 null after the call
-		const RE::TESFile*                           g_lastInflFile = nullptr;
-		std::uint32_t                                g_lastInflOffset = 0;
-		std::uint32_t                                g_lastInflFormID = 0;
-
-		[[nodiscard]] inline std::uint32_t Tid() noexcept { return SKSE::WinAPI::GetCurrentThreadID(); }
-
-		// The per-call identity check: measure only inside the window, only on
-		// the thread that opened it.
-		[[nodiscard]] inline bool Enter(Group a_g) noexcept
+		// ---- block pool ---------------------------------------------------------
+		Block* ClaimBlock(const Episode& a_ep) noexcept
 		{
-			const int st = g_state.load(std::memory_order_acquire);
-			if (st == kActive) {
-				if (Tid() == g_loadTid.load(std::memory_order_relaxed)) {
-					return true;
-				}
-				g_grp[a_g].foreign.inc();
-				return false;
+			const std::uint32_t i = g_blockNext.fetch_add(1, std::memory_order_relaxed);
+			if (i >= kMaxBlocks || !g_blocks) {
+				return nullptr;
 			}
-			if (st != kDone) {
-				g_grp[a_g].outside.inc();
+			Block& b = g_blocks[i];
+			b.episode.store(a_ep.index, std::memory_order_relaxed);
+			b.tid.store(Tid(), std::memory_order_relaxed);
+			b.startup = a_ep.startup;
+			if (a_ep.startup) {
+				b.slots = g_slots.get();
+				b.slotCap = kMaxSlots;
+			} else {
+				b.slots = &b.rt;
+				b.slotCap = 1;
 			}
-			return false;
+			return &b;
+		}
+
+		// A thread seen for the first time in this episode.
+		void EnterSlow(const Episode* a_ep, Tls& a_t) noexcept
+		{
+			a_t.ep = a_ep;
+			a_t.blk = nullptr;
+			a_t.child = 0;
+			a_t.exhausted = false;
+			if (a_ep->startup && Tid() != a_ep->loadTid.load(std::memory_order_relaxed)) {
+				return;  // startup measures the load thread only
+			}
+			Block* b = ClaimBlock(*a_ep);
+			if (b) {
+				a_t.blk = b;
+			} else {
+				a_t.exhausted = true;
+			}
+		}
+
+		// Cold: a call on a thread the startup episode does not measure.
+		void NoteForeign(Group a_g) noexcept
+		{
+			g_grp[a_g].foreign.inc();
+			const std::uint32_t id = Tid();
+			g_foreignTids.note(id);
+			const int ph = g_pubIi.load(std::memory_order_relaxed);
+			if (ph >= 0) {
+				g_iiTids[static_cast<std::size_t>(ph)].note(id);
+			}
+			const int sg = g_pubLf.load(std::memory_order_relaxed);
+			if (sg >= 0) {
+				g_lfTids[static_cast<std::size_t>(sg)].note(id);
+			}
+		}
+
+		// The per-call gate. null => do not measure (no episode open, a foreign thread
+		// during startup, or the block pool is exhausted). Zero overhead when idle.
+		[[nodiscard]] inline Block* Enter(Group a_g) noexcept
+		{
+			const Episode* e = g_curEp.load(std::memory_order_acquire);
+			if (!e) {
+				return nullptr;
+			}
+			Tls& t = t_tls;
+			if (t.ep != e) {
+				EnterSlow(e, t);
+			}
+			if (t.blk) {
+				return t.blk;
+			}
+			if (t.exhausted) {
+				g_blockDrops.inc();
+			} else {
+				NoteForeign(a_g);
+			}
+			return nullptr;
 		}
 
 		// Exclusive-time scope. The parent's child accumulator is saved in the
@@ -218,18 +153,163 @@ namespace lt::probe
 			std::uint64_t saved;
 			std::uint64_t t0;
 			Scope() noexcept :
-				saved(g_child), t0(__rdtsc()) { g_child = 0; }
+				saved(t_tls.child), t0(__rdtsc()) { t_tls.child = 0; }
 			// returns { inclusive, exclusive }
 			std::pair<std::uint64_t, std::uint64_t> End() noexcept
 			{
 				const std::uint64_t dt = __rdtsc() - t0;
-				const std::uint64_t ex = dt >= g_child ? dt - g_child : 0;
-				g_child = saved + dt;
+				const std::uint64_t ex = dt >= t_tls.child ? dt - t_tls.child : 0;
+				t_tls.child = saved + dt;
 				return { dt, ex };
 			}
 		};
 
-		[[nodiscard]] inline Slot& Cur() noexcept { return g_slots[g_cur]; }
+		// ---- phase / segment markers (startup block only) ----------------------------
+		// Monotonic "last hit wins" (Docs/LT-2b-sites-validated.md section 2). A phase
+		// starts at the first marker that fires for it; an empty array skips its marker
+		// and the time then lands in the previous phase. Passing -1 closes the open one.
+		inline void SetPhase(Block& a_b, std::int8_t a_ph) noexcept
+		{
+			if (!a_b.startup || a_b.iiPhase == a_ph) {
+				return;
+			}
+			const std::uint64_t now = __rdtsc();
+			const std::uint64_t cpu = ThreadCpu();
+			if (a_b.iiPhase >= 0) {
+				PhaseRow& r = a_b.ii[static_cast<std::size_t>(a_b.iiPhase)];
+				r.wall.add(now - a_b.iiStart);
+				r.cpu.add(cpu >= a_b.iiCpuStart ? cpu - a_b.iiCpuStart : 0);
+			}
+			a_b.iiPhase = a_ph;
+			a_b.iiStart = now;
+			a_b.iiCpuStart = cpu;
+			if (a_ph >= 0) {
+				a_b.ii[static_cast<std::size_t>(a_ph)].entries.add(1);
+				g_iiTids[static_cast<std::size_t>(a_ph)].note(Tid());
+			}
+			g_pubIi.store(a_ph, std::memory_order_relaxed);
+		}
+
+		inline void SetSeg(Block& a_b, std::int8_t a_seg) noexcept
+		{
+			if (!a_b.startup || a_b.lfSeg == a_seg) {
+				return;
+			}
+			const std::uint64_t now = __rdtsc();
+			const std::uint64_t cpu = ThreadCpu();
+			if (a_b.lfSeg >= 0) {
+				PhaseRow& r = a_b.lf[static_cast<std::size_t>(a_b.lfSeg)];
+				r.wall.add(now - a_b.lfStart);
+				r.cpu.add(cpu >= a_b.lfCpuStart ? cpu - a_b.lfCpuStart : 0);
+			}
+			a_b.lfSeg = a_seg;
+			a_b.lfStart = now;
+			a_b.lfCpuStart = cpu;
+			if (a_seg >= 0) {
+				a_b.lf[static_cast<std::size_t>(a_seg)].entries.add(1);
+				g_lfTids[static_cast<std::size_t>(a_seg)].note(Tid());
+			}
+			g_pubLf.store(a_seg, std::memory_order_relaxed);
+		}
+
+		// ---- small tables -------------------------------------------------------------
+		inline SigRow* FindSig(Block& a_b, std::uint32_t a_key) noexcept
+		{
+			const std::uint32_t key = a_key != 0 ? a_key : 0xFFFFFFFFu;
+			std::size_t         h = static_cast<std::size_t>((key * 2654435761u) >> 8) & (kSigSlots - 1);
+			for (std::size_t i = 0; i < kSigSlots; ++i) {
+				SigRow&             row = a_b.sig[(h + i) & (kSigSlots - 1)];
+				const std::uint32_t k = row.key.get();
+				if (k == key) {
+					return &row;
+				}
+				if (k == 0) {
+					row.key.set(key);
+					return &row;
+				}
+			}
+			a_b.sigOverflow.add(1);
+			return nullptr;
+		}
+
+		inline void NoteHeavy(Block& a_b, std::uint64_t a_dt, std::uint32_t a_formID, std::uint32_t a_sig, const RE::TESFile* a_file) noexcept
+		{
+			if (a_dt <= a_b.heavyMin) {
+				return;
+			}
+			HeavyRow& r = a_b.heavy[a_b.heavyMinIdx];
+			r.ticks.set(a_dt);
+			r.formID.set(a_formID);
+			r.sig.set(a_sig);
+			r.file.store(a_file, std::memory_order_relaxed);
+			std::uint64_t mn = ~0ULL;
+			std::uint32_t mi = 0;
+			for (std::uint32_t i = 0; i < kTopHeavy; ++i) {
+				const std::uint64_t t = a_b.heavy[i].ticks.get();
+				if (t < mn) {
+					mn = t;
+					mi = i;
+				}
+			}
+			a_b.heavyMin = mn;
+			a_b.heavyMinIdx = mi;
+		}
+
+		inline FileRow* FindFile(std::uint64_t a_ptr) noexcept
+		{
+			if (!g_files || a_ptr == 0) {
+				return nullptr;
+			}
+			const std::size_t h = static_cast<std::size_t>(((a_ptr >> 4) * 0x9E3779B97F4A7C15ULL) >> 40) & (kFileRows - 1);
+			const void*       key = reinterpret_cast<const void*>(a_ptr);
+			for (std::size_t i = 0; i < kFileRows; ++i) {
+				FileRow&    r = g_files[(h + i) & (kFileRows - 1)];
+				const void* k = r.file.load(std::memory_order_relaxed);
+				if (k == key) {
+					return &r;
+				}
+				if (!k) {
+					r.file.store(key, std::memory_order_relaxed);
+					return &r;
+				}
+			}
+			g_fileRowDrops.inc();
+			return nullptr;
+		}
+
+		constexpr std::size_t FileColIdx(sites::Col a_c) noexcept
+		{
+			switch (a_c) {
+			case sites::Col::kCompileIdx:
+				return 0;
+			case sites::Col::kBsaGate:
+				return 1;
+			case sites::Col::kBsaLoad:
+				return 2;
+			default:
+				return 3;  // kPass1Open
+			}
+		}
+
+		constexpr Group GroupOf(sites::Owner a_o) noexcept
+		{
+			switch (a_o) {
+			case sites::Owner::kLoadFiles:
+				return kLfCallees;
+			case sites::Owner::kInitPass:
+				return kInitPass;
+			case sites::Owner::kPluginLoop:
+				return kLoopSplit;
+			default:
+				return kNewForms;
+			}
+		}
+
+		constexpr Group VfGroup(std::size_t a_i) noexcept
+		{
+			return sites::kVfSites[a_i].kind == sites::VfKind::kCore ? kPerForm :
+			       (a_i < sites::kVfPassCount ? kInitPass : kInitRefs);
+		}
 
 		// ---- thunks ---------------------------------------------------------------
 
@@ -238,38 +318,60 @@ namespace lt::probe
 		// [I] that the other two callers (0x6492FC, 0x942CFF) are not the
 		// startup load: 36553 is the InitTES body (FEASIBILITY.md [V]); the
 		// one-shot CAS below also limits the window to the FIRST call.
-		// Opens the measurement window on the calling thread, closes it when
-		// 13753 returns, and emits the report if kDataLoaded was already seen.
+		// Opens episode 0 on the calling thread, closes it when 13753 returns, and
+		// emits the report if kDataLoaded was already seen.
 		void TryReport(const char* a_trigger);
 
 		std::uint64_t LoadFilesThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origLoadFiles);
-			int expected = kIdle;
+			int        expected = kIdle;
 			if (!g_state.compare_exchange_strong(expected, kArming)) {
 				return orig(a1, a2, a3, a4);  // not the first call, or the probe is off
 			}
+			Episode& e = g_eps[0];
+			e.loadTid.store(Tid(), std::memory_order_relaxed);
 			g_loadTid.store(Tid(), std::memory_order_relaxed);
-			g_cur = 0;
-			g_child = 0;
-			g_t0 = std::chrono::steady_clock::now();
-			g_tsc0 = __rdtsc();
-			g_grp[kGate].measured.add(1);
+			e.openTid = Tid();
+			e.t0 = std::chrono::steady_clock::now();
+			e.tsc0 = __rdtsc();
+			e.procCpu0 = ProcessCpu();
+
+			// The load thread's block is claimed here and installed in its TLS, so the first
+			// hooked call inside the window takes the fast path.
+			Block* b = ClaimBlock(e);
+			t_tls.ep = &e;
+			t_tls.blk = b;
+			t_tls.child = 0;
+			t_tls.exhausted = (b == nullptr);
+			if (b) {
+				b->measured[kGate].add(1);
+				SetSeg(*b, sites::kLfSetup);
+			}
+			g_curEp.store(&e, std::memory_order_seq_cst);
 			g_state.store(kActive);  // seq_cst
 
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
 
-			g_tsc1 = __rdtsc();
-			g_t1 = std::chrono::steady_clock::now();
-			g_loadFilesTicks.add(dt);
-			g_loadFilesEx.add(ex);
+			e.tsc1 = __rdtsc();
+			e.t1 = std::chrono::steady_clock::now();
+			e.procCpu1 = ProcessCpu();
+			e.closeTid = Tid();
+			g_curEp.store(nullptr, std::memory_order_seq_cst);
+			if (b) {
+				SetSeg(*b, -1);
+				SetPhase(*b, -1);
+				b->loadFilesTicks.add(dt);
+				b->loadFilesEx.add(ex);
+			}
+			e.closed.store(true);
 			g_state.store(kClosed);  // seq_cst; publishes every accumulator
 
-			const auto ms = std::chrono::duration<double, std::milli>(g_t1 - g_t0).count();
-			spdlog::info("[gate] startup LoadFiles returned after {:.1f} ms on thread {}; {} plugin slot(s). Window closed.",
-				ms, g_loadTid.load(std::memory_order_relaxed), g_slotCount.load(std::memory_order_relaxed) - 1);
+			const auto ms = std::chrono::duration<double, std::milli>(e.t1 - e.t0).count();
+			spdlog::info("[gate] startup LoadFiles returned after {:.1f} ms on thread {}; {} plugin slot(s). Episode '{}' closed.",
+				ms, g_loadTid.load(std::memory_order_relaxed), b ? b->slotCount.load(std::memory_order_relaxed) - 1 : 0u, e.name);
 			spdlog::default_logger()->flush();
 
 			if (g_dataLoadedSeen.load()) {  // seq_cst: pairs with OnDataLoaded (Dekker)
@@ -284,28 +386,29 @@ namespace lt::probe
 		std::uint64_t LoadFileThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origLoadFile);
-			if (!Enter(kPerPlugin)) {
+			Block*     b = Enter(kPerPlugin);
+			if (!b) {
 				return orig(a1, a2, a3, a4);
 			}
-			g_grp[kPerPlugin].measured.add(1);
-			std::uint32_t idx = g_slotCount.load(std::memory_order_relaxed);
-			if (idx < kMaxSlots) {
-				g_slotCount.store(idx + 1, std::memory_order_relaxed);
-				g_slots[idx].file.store(reinterpret_cast<const RE::TESFile*>(a2), std::memory_order_relaxed);
+			b->measured[kPerPlugin].add(1);
+			std::uint32_t idx = b->slotCount.load(std::memory_order_relaxed);
+			if (idx < b->slotCap) {
+				b->slotCount.store(idx + 1, std::memory_order_relaxed);
+				b->slots[idx].file.store(reinterpret_cast<const RE::TESFile*>(a2), std::memory_order_relaxed);
 			} else {
 				idx = 0;
-				g_slotOverflow.add(1);
+				b->slotOverflow.add(1);
 			}
-			const std::uint32_t prev = g_cur;
-			g_cur = idx;
+			const std::uint32_t prev = b->cur;
+			b->cur = idx;
 
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
 
-			g_slots[idx].wall.add(dt);
-			g_slots[idx].loopEx.add(ex);
-			g_cur = prev;
+			b->slots[idx].wall.add(dt);
+			b->slots[idx].loopEx.add(ex);
+			b->cur = prev;
 			return r;
 		}
 
@@ -316,11 +419,12 @@ namespace lt::probe
 		std::uint64_t LoadRecordThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4, std::uint64_t a5)
 		{
 			const auto orig = reinterpret_cast<Fn5>(g_origLoadRecord);
-			if (!Enter(kRecord)) {
+			Block*     b = Enter(kRecord);
+			if (!b) {
 				return orig(a1, a2, a3, a4, a5);
 			}
-			g_grp[kRecord].measured.add(1);
-			Slot&      slot = Cur();
+			b->measured[kRecord].add(1);
+			Slot&      slot = b->slots[b->cur];
 			const auto* file = reinterpret_cast<const RE::TESFile*>(a2);
 			if (file && (file->currentform.flags & kCompressedFlag) != 0) {
 				slot.compressed.add(1);
@@ -339,22 +443,42 @@ namespace lt::probe
 		// LOAD BODIES. The 16 calls of 13690 inside 13763 -> 0x1B11F0.
 		// [V] bytes; [V] args rcx=form, rdx=file; returns Load's bool in eax.
 		// Exclusive time = the form-type Load bodies minus nested ReadData/inflate.
+		// The record signature, data size, flags and FormID are the header fields
+		// 13763 has already put in file->currentform (read before the call).
 		std::uint64_t LoadFormThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origLoadForm);
-			if (!Enter(kLoadBody)) {
+			Block*     b = Enter(kLoadBody);
+			if (!b) {
 				return orig(a1, a2, a3, a4);
 			}
-			g_grp[kLoadBody].measured.add(1);
-			Slot& slot = Cur();
+			b->measured[kLoadBody].add(1);
+			Slot&         slot = b->slots[b->cur];
+			const auto*   file = reinterpret_cast<const RE::TESFile*>(a2);
+			std::uint32_t sig = 0, len = 0, flags = 0, fid = 0;
+			if (file) {
+				sig = file->currentform.form;
+				len = file->currentform.length;
+				flags = file->currentform.flags;
+				fid = file->currentform.formID;
+			}
 
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
-			(void)dt;
 
 			slot.loadN.add(1);
 			slot.loadEx.add(ex);
+			if (SigRow* row = FindSig(*b, sig)) {
+				row->count.add(1);
+				row->ticks.add(dt);
+				row->exTicks.add(ex);
+				row->bytes.add(len);
+				if ((flags & kCompressedFlag) != 0) {
+					row->compressed.add(1);
+				}
+			}
+			NoteHeavy(*b, dt, fid, sig, file);
 			return r;
 		}
 
@@ -366,11 +490,12 @@ namespace lt::probe
 		std::uint64_t ReadDataThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origReadData);
-			if (!Enter(kRawRead)) {
+			Block*     b = Enter(kRawRead);
+			if (!b) {
 				return orig(a1, a2, a3, a4);
 			}
-			g_grp[kRawRead].measured.add(1);
-			Slot& slot = Cur();
+			b->measured[kRawRead].add(1);
+			Slot& slot = b->slots[b->cur];
 
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
@@ -379,6 +504,7 @@ namespace lt::probe
 
 			slot.readN.add(1);
 			slot.readEx.add(ex);
+			b->readBytes.add(static_cast<std::uint32_t>(a3));  // r8d = size
 			return r;
 		}
 
@@ -390,32 +516,33 @@ namespace lt::probe
 		std::uint64_t InflateThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origInflate);
-			if (!Enter(kInflate)) {
+			Block*     b = Enter(kInflate);
+			if (!b) {
 				return orig(a1, a2, a3, a4);
 			}
-			g_grp[kInflate].measured.add(1);
-			g_inflBySite[I].add(1);
-			Slot&      slot = Cur();
-			const auto* file = reinterpret_cast<const RE::TESFile*>(a1);
+			b->measured[kInflate].add(1);
+			b->inflBySite[I].add(1);
+			Slot&         slot = b->slots[b->cur];
+			const auto*   file = reinterpret_cast<const RE::TESFile*>(a1);
 			std::uint32_t in = 0;
 			if (file) {
 				in = file->currentform.length;
 				if (file->decompressedFormBuffer != nullptr) {
-					g_inflPreset.add(1);
+					b->inflPreset.add(1);
 				}
 				const std::uint32_t off = file->fileOffset;
 				const std::uint32_t fid = file->currentform.formID;
-				if (file == g_lastInflFile && off == g_lastInflOffset && fid == g_lastInflFormID) {
-					g_inflRepeat.add(1);
+				if (file == b->lastInflFile && off == b->lastInflOffset && fid == b->lastInflFormID) {
+					b->inflRepeat.add(1);
 				}
-				g_lastInflFile = file;
-				g_lastInflOffset = off;
-				g_lastInflFormID = fid;
+				b->lastInflFile = file;
+				b->lastInflOffset = off;
+				b->lastInflFormID = fid;
 				if (file != slot.file.load(std::memory_order_relaxed)) {
-					g_inflForeignFile.add(1);
+					b->inflForeignFile.add(1);
 				}
 			} else {
-				g_inflNullFile.add(1);
+				b->inflNullFile.add(1);
 			}
 
 			Scope s;
@@ -427,7 +554,7 @@ namespace lt::probe
 			if (file) {
 				out = file->decompressedFormBufferSize;
 				if (file->decompressedFormBuffer == nullptr) {
-					g_inflFailed.add(1);
+					b->inflFailed.add(1);
 				}
 			}
 			slot.inflN.add(1);
@@ -438,26 +565,173 @@ namespace lt::probe
 		}
 
 		// POST-LOOP. Site 13753+0x363 (0x1B9A43) -> 13784, the InitItem pass.
-		// [V] bytes; [V] one arg rcx=dh. One wall time.
+		// [V] bytes; [V] one arg rcx=dh. Wall time, and P0 starts here (phase markers).
 		std::uint64_t InitItemsThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
 		{
 			const auto orig = reinterpret_cast<Fn4>(g_origInitItems);
-			if (!Enter(kPostLoop)) {
+			Block*     b = Enter(kPostLoop);
+			if (!b) {
 				return orig(a1, a2, a3, a4);
 			}
-			g_grp[kPostLoop].measured.add(1);
-			const std::uint32_t prev = g_cur;
-			g_cur = 0;  // InitItem work is not any one plugin's
+			b->measured[kPostLoop].add(1);
+			const std::uint32_t prev = b->cur;
+			b->cur = 0;  // InitItem work is not any one plugin's
+			b->avifHits = 0;
+			SetSeg(*b, sites::kLfInitItems);
+			SetPhase(*b, sites::kIiDobj);
 
 			Scope s;
 			const std::uint64_t r = orig(a1, a2, a3, a4);
 			const auto [dt, ex] = s.End();
 
-			g_initItemsTicks.add(dt);
-			g_initItemsEx.add(ex);
-			g_cur = prev;
+			SetPhase(*b, -1);
+			b->initItemsTicks.add(dt);
+			b->initItemsEx.add(ex);
+			b->cur = prev;
 			return r;
 		}
+
+		// ---- v2: the 55 E8 sites (13753 / 13784 / 13760 / 13763 callees) ---------------
+		// One template instance per kTimedSites row, so the segment markers, the column
+		// and the owner are compile-time constants. [V] Docs/LT-2b-sites-validated.md:
+		// no callee reads a stack (5th) argument or an xmm argument, so the generic
+		// 4-register form is exact. The original is the row's verified callee.
+		template <std::size_t I>
+		std::uint64_t TimedThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
+		{
+			constexpr const sites::TimedSite& S = sites::kTimedSites[I];
+			constexpr Group                   G = GroupOf(S.owner);
+			const auto                        orig = reinterpret_cast<Fn4>(g_timedOrig[I]);
+			Block*                            b = Enter(G);
+			if (!b) {
+				return orig(a1, a2, a3, a4);
+			}
+			b->measured[G].add(1);
+			if constexpr (S.owner == sites::Owner::kLoadFiles) {
+				if constexpr (S.segEntry >= 0) {
+					SetSeg(*b, S.segEntry);
+				}
+			} else if constexpr (S.owner == sites::Owner::kInitPass) {
+				if constexpr (S.segEntry >= 0) {
+					SetPhase(*b, S.segEntry);
+				}
+			}
+			std::size_t newType = kTypeCount;
+			if constexpr (S.col == sites::Col::kNewForm) {
+				if (a2 != 0) {
+					newType = TypeIdx(FormTypeByte(a2));  // rdx = the new form (read-only)
+				}
+			}
+
+			Scope s;
+			const std::uint64_t r = orig(a1, a2, a3, a4);
+			const auto [dt, ex] = s.End();
+
+			if constexpr (S.owner == sites::Owner::kInitPass && S.segExit >= 0) {
+				SetPhase(*b, S.segExit);
+			}
+			CalleeRow& row = b->callee[I];
+			row.n.add(1);
+			row.ticks.add(dt);
+			row.ex.add(ex);
+
+			if constexpr (S.col == sites::Col::kNewForm) {
+				b->newForms[newType].add(1);
+				b->newFormTicks[newType].add(dt);
+			} else if constexpr (S.file != sites::FileArg::kNone) {
+				if (b->startup) {
+					const std::uint64_t fp = (S.file == sites::FileArg::kRcx) ? a1 :
+					                         (S.file == sites::FileArg::kRdx) ? a2 :
+					                                                            a1 - 0x58;
+					if (FileRow* fr = FindFile(fp)) {
+						fr->t[FileColIdx(S.col)].add(ex);
+						if constexpr (S.col == sites::Col::kBsaGate) {
+							if ((r & 0xFF) != 0) {
+								fr->gateTrue.add(1);
+							}
+						}
+					}
+				}
+			} else if constexpr (S.col != sites::Col::kNone) {
+				Slot& sl = b->slots[b->cur];
+				sl.colT[static_cast<std::size_t>(S.col)].add(ex);
+				sl.colN[static_cast<std::size_t>(S.col)].add(1);
+			}
+			return r;
+		}
+
+		template <std::size_t... Is>
+		constexpr std::array<Fn4, sizeof...(Is)> MakeTimedThunks(std::index_sequence<Is...>) noexcept
+		{
+			return { &TimedThunk<Is>... };
+		}
+
+		// ---- v2: the 10 virtual InitItem calls (6-byte `call [rax|rdx+98h]`) ---------------
+		// Patched with write_call<6> (FF 15 disp32 -> an 8-byte trampoline slot), so the
+		// return address stays site+6 exactly as in the original. The original target is
+		// per object: the thunk reads the vtable slot at call time, (*(fn**)(*(char**)rcx + 0x98)),
+		// forwards rcx/rdx/r8/r9 unchanged and returns rax untouched (InitItem is void; rax is
+		// whatever the callee left). write_call<6>'s own return value is garbage for these
+		// sites and is ignored. [V] Sites.h comment block above kVfSites.
+		template <std::size_t I>
+		std::uint64_t VfThunk(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4)
+		{
+			constexpr const sites::VfSite& S = sites::kVfSites[I];
+			constexpr Group                G = VfGroup(I);
+			const auto fn = *reinterpret_cast<const Fn4*>(*reinterpret_cast<const std::uintptr_t*>(a1) + sites::kInitItemSlotOffset);
+			Block*     b = Enter(G);
+			if (!b) {
+				return fn(a1, a2, a3, a4);
+			}
+			b->measured[G].add(1);
+			if constexpr (S.phaseEntry >= 0) {
+				SetPhase(*b, S.phaseEntry);
+			}
+			std::uint8_t  type = 0;
+			std::uint32_t formID = 0;
+			if constexpr (S.kind == sites::VfKind::kCore) {
+				type = FormTypeByte(a1);  // rcx = the form; the type index t equals formType [I] (see report note)
+				formID = FormIdOf(a1);
+			}
+
+			Scope s;
+			const std::uint64_t r = fn(a1, a2, a3, a4);
+			const auto [dt, ex] = s.End();
+
+			if constexpr (S.phaseExit >= 0) {
+				SetPhase(*b, S.phaseExit);
+			}
+			if constexpr (S.kind == sites::VfKind::kAvif) {
+				b->avifHits += 1;
+				if (b->avifHits == sites::kAvifCount) {
+					SetPhase(*b, sites::kIiNpc);  // P5 starts at the return of the 0xA4-th AVIF InitItem
+				}
+			}
+			CalleeRow& row = b->vf[I];
+			row.n.add(1);
+			row.ticks.add(dt);
+			row.ex.add(ex);
+			if constexpr (S.kind == sites::VfKind::kCore) {
+				TypeRow& t = b->type[TypeIdx(type)];
+				t.count.add(1);
+				t.ticks.add(dt);
+				if (dt > t.maxTicks.get()) {
+					t.maxTicks.set(dt);
+					t.maxForm.set(formID);
+				}
+				t.hist[HistBucket(dt)].add(1);
+			}
+			return r;
+		}
+
+		template <std::size_t... Is>
+		constexpr std::array<Fn4, sizeof...(Is)> MakeVfThunks(std::index_sequence<Is...>) noexcept
+		{
+			return { &VfThunk<Is>... };
+		}
+
+		constexpr auto kTimedThunks = MakeTimedThunks(std::make_index_sequence<kTimedCount>{});
+		constexpr auto kVfThunks = MakeVfThunks(std::make_index_sequence<kVfCount>{});
 
 		// ---- install-time verification -----------------------------------------
 
@@ -530,6 +804,44 @@ namespace lt::probe
 			return true;
 		}
 
+		// 6-byte virtual call: FF 90|92 98 00 00 00 (call [rax|rdx+98h]) at the site, and the
+		// FNV-1a 64 hash of [site-pre, site+6) equals the validated window hash (the pre bytes
+		// load the vtable register from [rcx], which the thunk relies on).
+		bool CheckVfSite(const sites::VfSite& a_v, std::uintptr_t& a_site, std::string& a_why)
+		{
+			const REL::ID       id{ a_v.site.fnId };
+			const std::uintptr_t off = id.offset();
+			if (off != a_v.site.fnRva) {
+				a_why = std::format("site {}: the Address Library maps id {} to RVA 0x{:X}, the verified table says 0x{:X}",
+					a_v.site.name, a_v.site.fnId, off, a_v.site.fnRva);
+				return false;
+			}
+			a_site = id.address() + a_v.site.off;
+			const std::uintptr_t base = REL::Module::get().base();
+			const std::size_t    len = static_cast<std::size_t>(a_v.pre) + 6;
+			std::array<std::uint8_t, 12> w{};
+			std::memcpy(w.data(), reinterpret_cast<const void*>(a_site - a_v.pre), len);
+			const std::uint8_t* call = w.data() + a_v.pre;
+			std::int32_t        disp = 0;
+			std::memcpy(&disp, call + 2, sizeof(disp));
+			const std::uint64_t hash = sites::Fnv1a64(w.data(), len);
+			if (g_cfg.verbose) {
+				spdlog::info("[verify] {} @RVA 0x{:X}: window {} hash 0x{:016X} (expected 0x{:016X})",
+					a_v.site.name, a_site - base, HexBytes(w.data(), len), hash, a_v.windowHash);
+			}
+			if (call[0] != 0xFF || (call[1] != 0x90 && call[1] != 0x92) || disp != static_cast<std::int32_t>(sites::kInitItemSlotOffset)) {
+				a_why = std::format("site {} @RVA 0x{:X}: expected FF 90|92 98 00 00 00, found {}", a_v.site.name, a_site - base,
+					HexBytes(call, 6));
+				return false;
+			}
+			if (hash != a_v.windowHash) {
+				a_why = std::format("site {} @RVA 0x{:X}: window hash 0x{:016X} != validated 0x{:016X} (another plugin patched the code?) bytes {}",
+					a_v.site.name, a_site - base, hash, a_v.windowHash, HexBytes(w.data(), len));
+				return false;
+			}
+			return true;
+		}
+
 		void Refuse(Group a_g, std::string a_why)
 		{
 			g_grp[a_g].installed = false;
@@ -553,208 +865,76 @@ namespace lt::probe
 			}
 		}
 
-		// ---- report ----------------------------------------------------------------
-
-		std::string SafeName(const RE::TESFile* a_f)
+		void ResolveOsFunctions()
 		{
-			if (!a_f) {
-				return "(null file)";
+			const auto k32 = REX::W32::GetModuleHandleW(L"kernel32.dll");
+			if (!k32) {
+				return;
 			}
-			std::string s;
-			for (std::size_t i = 0; i < sizeof(a_f->fileName) && a_f->fileName[i] != '\0'; ++i) {
-				const auto c = static_cast<unsigned char>(a_f->fileName[i]);
-				s += (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';  // ASCII only in the log
-			}
-			return s.empty() ? std::string("(empty name)") : s;
+			g_getThreadTimes = reinterpret_cast<decltype(g_getThreadTimes)>(REX::W32::GetProcAddress(k32, "GetThreadTimes"));
+			g_getProcessTimes = reinterpret_cast<decltype(g_getProcessTimes)>(REX::W32::GetProcAddress(k32, "GetProcessTimes"));
 		}
 
-		struct Totals
+		// ---- runtime episodes: the Loading Menu -------------------------------------------
+		// READ-ONLY event sink on UI's MenuOpenCloseEvent source. It writes nothing into the
+		// engine and calls no engine function; it only opens/closes an episode.
+		void OpenRuntimeEpisode()
 		{
-			std::uint64_t wall = 0, loopEx = 0, records = 0, compressed = 0, recEx = 0;
-			std::uint64_t loadN = 0, loadEx = 0, readN = 0, readEx = 0;
-			std::uint64_t inflN = 0, inflEx = 0, inflIn = 0, inflOut = 0;
-			void Add(const Slot& a_s)
+			if (!g_dataLoadedSeen.load()) {
+				return;
+			}
+			if (g_curEp.load(std::memory_order_acquire) != nullptr) {
+				g_epSkipped.inc();  // the startup episode, or a previous loading screen, is still open
+				return;
+			}
+			const std::uint32_t n = g_epOpened.load(std::memory_order_relaxed);
+			if (n >= kMaxRuntimeEpisodes) {
+				g_epDropped.inc();
+				return;
+			}
+			Episode& e = g_eps[1 + n];
+			e.index = 1 + n;
+			e.startup = false;
+			e.name = std::format("runtime-loadscreen-{}", n + 1);
+			e.openTid = Tid();
+			e.t0 = std::chrono::steady_clock::now();
+			e.tsc0 = __rdtsc();
+			e.procCpu0 = ProcessCpu();
+			g_epOpened.store(n + 1, std::memory_order_relaxed);
+			g_curEp.store(&e, std::memory_order_seq_cst);
+		}
+
+		void CloseRuntimeEpisode()
+		{
+			Episode* e = g_curEp.load(std::memory_order_acquire);
+			if (!e || e->startup) {
+				return;
+			}
+			g_curEp.store(nullptr, std::memory_order_seq_cst);
+			e->tsc1 = __rdtsc();
+			e->t1 = std::chrono::steady_clock::now();
+			e->procCpu1 = ProcessCpu();
+			e->closeTid = Tid();
+			e->closed.store(true);
+			WriteRuntimeReport(*e);
+		}
+
+		class LoadingMenuSink final : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
 			{
-				wall += a_s.wall.get();
-				loopEx += a_s.loopEx.get();
-				records += a_s.records.get();
-				compressed += a_s.compressed.get();
-				recEx += a_s.recEx.get();
-				loadN += a_s.loadN.get();
-				loadEx += a_s.loadEx.get();
-				readN += a_s.readN.get();
-				readEx += a_s.readEx.get();
-				inflN += a_s.inflN.get();
-				inflEx += a_s.inflEx.get();
-				inflIn += a_s.inflIn.get();
-				inflOut += a_s.inflOut.get();
+				if (a_event && a_event->menuName == "Loading Menu"sv) {
+					if (a_event->opening) {
+						OpenRuntimeEpisode();
+					} else {
+						CloseRuntimeEpisode();
+					}
+				}
+				return RE::BSEventNotifyControl::kContinue;
 			}
 		};
-
-		// Cost of what every measured call adds: two rdtsc + the thread-id read.
-		double MeasureProbeCostTicks()
-		{
-			constexpr int          kN = 200000;
-			volatile std::uint64_t sink = 0;
-			const std::uint64_t    t0 = __rdtsc();
-			for (int i = 0; i < kN; ++i) {
-				const std::uint64_t a = __rdtsc();
-				sink = sink + Tid();
-				const std::uint64_t b = __rdtsc();
-				sink = sink + (b - a);
-			}
-			return static_cast<double>(__rdtsc() - t0) / kN;
-		}
-
-		void Line(const std::string& a_s) { spdlog::info("{}", a_s); }
-
-		void WriteGroupTable()
-		{
-			Line("Hook groups (UNPROVEN = installed but never fired; its zeros mean nothing):");
-			for (std::size_t g = 0; g < kGroupCount; ++g) {
-				const auto& gs = g_grp[g];
-				std::string status;
-				if (!gs.requested) {
-					status = "off by INI";
-				} else if (!gs.installed) {
-					status = "NOT HOOKED: " + gs.why;
-				} else if (gs.measured.get() == 0) {
-					status = std::format("installed ({} sites), UNPROVEN: 0 measured calls", gs.sites);
-				} else {
-					status = std::format("installed ({} sites)", gs.sites);
-				}
-				Line(std::format("  {:<42} measured={:<11} foreignThread={:<8} outsideWindow={:<8} {}",
-					kGroupNames[g], gs.measured.get(), gs.foreign.get(), gs.outside.get(), status));
-			}
-		}
-
-		void WriteReport(const char* a_trigger)
-		{
-			Line("==================== LoadingThreader LT-2 report ====================");
-			Line(std::format("trigger: {}", a_trigger));
-			if (!g_gateInstalled) {
-				Line(std::format("PROBE INACTIVE: {}", g_inactiveWhy));
-				WriteGroupTable();
-				Line("=====================================================================");
-				spdlog::default_logger()->flush();
-				return;
-			}
-			if (g_grp[kGate].measured.get() == 0) {
-				Line("UNPROVEN: the startup LoadFiles call never went through the gate; no data was collected.");
-				WriteGroupTable();
-				Line("=====================================================================");
-				spdlog::default_logger()->flush();
-				return;
-			}
-
-			const double winMs = std::chrono::duration<double, std::milli>(g_t1 - g_t0).count();
-			const double tsc = static_cast<double>(g_tsc1 - g_tsc0);
-			const double tpm = (winMs > 0.0 && tsc > 0.0) ? tsc / winMs : 0.0;  // TSC ticks per ms
-			const auto   ms = [tpm](std::uint64_t a_t) { return tpm > 0.0 ? static_cast<double>(a_t) / tpm : 0.0; };
-			const double lf = ms(g_loadFilesTicks.get());
-			const auto   pct = [lf](double a_ms) { return lf > 0.0 ? 100.0 * a_ms / lf : 0.0; };
-
-			const std::uint32_t n = g_slotCount.load(std::memory_order_relaxed);
-			Totals              all;
-			for (std::uint32_t i = 0; i < n; ++i) {
-				all.Add(g_slots[i]);
-			}
-
-			Line(std::format("load thread id: {}   kDataLoaded thread id: {}   gate chained to a foreign patch: {}",
-				g_loadTid.load(), g_dataLoadedTid.load(), g_gateChained ? "YES (LoadFiles ms includes the interposer)" : "no"));
-			Line(std::format("LoadFiles (13753) total: {:.1f} ms (steady_clock), {:.1f} ms (TSC); TSC = {:.0f} ticks/ms",
-				winMs, lf, tpm));
-			Line(std::format("plugins measured: {} (slot overflow: {})", n - 1, g_slotOverflow.get()));
-			WriteGroupTable();
-
-			const double costTicks = MeasureProbeCostTicks();
-			std::uint64_t calls = 0;
-			for (std::size_t g = 0; g < kGroupCount; ++g) {
-				calls += g_grp[g].measured.get();
-			}
-			Line(std::format("probe cost estimate: {} measured calls x {:.0f} ticks = {:.1f} ms of the total (excludes stub jumps)",
-				calls, costTicks, ms(static_cast<std::uint64_t>(costTicks * static_cast<double>(calls)))));
-
-			// ---- global split (exclusive times; they sum to LoadFiles) ----
-			const double inflMs = ms(all.inflEx);
-			const double readMs = ms(all.readEx);
-			const double loadMs = ms(all.loadEx);
-			const double recMs = ms(all.recEx);
-			const double loopMs = ms(all.loopEx);
-			const double postMs = ms(g_initItemsTicks.get());
-			const double postExMs = ms(g_initItemsEx.get());
-			const double restMs = ms(g_loadFilesEx.get());
-			Line("Global split of LoadFiles (exclusive ms, % of LoadFiles):");
-			Line(std::format("  inflate   14032          {:>10.1f} ms  {:>5.1f} %", inflMs, pct(inflMs)));
-			Line(std::format("  raw read  13991 (excl)   {:>10.1f} ms  {:>5.1f} %", readMs, pct(readMs)));
-			Line(std::format("  Load bodies 13690 (excl) {:>10.1f} ms  {:>5.1f} %", loadMs, pct(loadMs)));
-			Line(std::format("  record dispatch 13763 ex {:>10.1f} ms  {:>5.1f} %", recMs, pct(recMs)));
-			Line(std::format("  per-plugin loop 13760 ex {:>10.1f} ms  {:>5.1f} %  (OpenTES, seek/header, editor-ID R7, progress, CloseTES)", loopMs, pct(loopMs)));
-			Line(std::format("  post-loop 13784 (incl)   {:>10.1f} ms  {:>5.1f} %  (exclusive {:.1f} ms)", postMs, pct(postMs), postExMs));
-			Line(std::format("  LoadFiles rest 13753 ex  {:>10.1f} ms  {:>5.1f} %  (pass 1, 13767, 13403, 30433, ...)", restMs, pct(restMs)));
-			Line(std::format("  sum of plugin walls      {:>10.1f} ms  {:>5.1f} %", ms(all.wall), pct(ms(all.wall))));
-			Line(std::format("SHARES: inflate {:.1f} %, raw read {:.1f} %, Load bodies {:.1f} %, post-loop {:.1f} %",
-				pct(inflMs), pct(readMs), pct(loadMs), pct(postMs)));
-
-			// ---- decision rule (Docs/LT-2-probe-howto.md) ----
-			if (!g_grp[kInflate].installed || g_grp[kInflate].measured.get() == 0) {
-				Line("DECISION: UNPROVEN -- the inflate group did not measure anything.");
-			} else if (pct(inflMs) > 15.0) {
-				Line(std::format("DECISION: inflate share {:.1f} % > 15 %: stage 2 (decompress-ahead pool + RETURN hook at 14032) IS worth building.", pct(inflMs)));
-			} else if (pct(inflMs) < 5.0) {
-				Line(std::format("DECISION: inflate share {:.1f} % < 5 %: stage 2 is NOT worth building.", pct(inflMs)));
-			} else {
-				Line(std::format("DECISION: inflate share {:.1f} % is in the 5-15 % grey zone: marginal; weigh against the other shares.", pct(inflMs)));
-			}
-
-			// ---- LT-1 section 7 item 2 ----
-			Line("Inflate diagnostics (LT-1 7.2):");
-			Line(std::format("  inflates {}  in {} bytes  out {} bytes  ratio {:.2f}", all.inflN, all.inflIn, all.inflOut,
-				all.inflIn ? static_cast<double>(all.inflOut) / static_cast<double>(all.inflIn) : 0.0));
-			for (std::size_t i = 0; i < sites::kInflateSites.size(); ++i) {
-				Line(std::format("  via {:<40} {}", sites::kInflateSites[i].name, g_inflBySite[i].get()));
-			}
-			Line(std::format("  records dispatched {}  of which compressed-flag {}  (expect inflates == compressed if each is inflated once)",
-				all.records, all.compressed));
-			Line(std::format("  entered with +0x4A0 already set: {}   same record inflated twice in a row: {}   failed (+0x4A0 null after): {}",
-				g_inflPreset.get(), g_inflRepeat.get(), g_inflFailed.get()));
-			Line(std::format("  file != current plugin: {}   null file: {}", g_inflForeignFile.get(), g_inflNullFile.get()));
-
-			// ---- tables ----
-			const auto row = [&](std::uint32_t a_i) {
-				const Slot& s = g_slots[a_i];
-				return std::format("  {:>5} {:>9.1f} {:>9} {:>8} {:>9.1f} {:>9.1f} {:>8} {:>11} {:>11} {:>8.1f}  {}",
-					a_i, ms(s.wall.get()), s.records.get(), s.compressed.get(), ms(s.loadEx.get()), ms(s.readEx.get()),
-					s.inflN.get(), s.inflIn.get(), s.inflOut.get(), ms(s.inflEx.get()),
-					a_i == 0 ? std::string("(inside LoadFiles, outside any plugin)") : SafeName(s.file.load()));
-			};
-			const std::string header = "  slot    wall_ms   records compress   load_ms   read_ms  infl_n    infl_in_B   infl_out_B  infl_ms  plugin";
-
-			std::vector<std::uint32_t> order;
-			order.reserve(n);
-			for (std::uint32_t i = 1; i < n; ++i) {
-				order.push_back(i);
-			}
-			std::sort(order.begin(), order.end(), [](std::uint32_t a, std::uint32_t b) {
-				return g_slots[a].wall.get() > g_slots[b].wall.get();
-			});
-			const std::size_t top = std::min<std::size_t>(order.size(), static_cast<std::size_t>(std::max(0, g_cfg.topN)));
-			Line(std::format("Top {} plugins by wall time:", top));
-			Line(header);
-			for (std::size_t k = 0; k < top; ++k) {
-				Line(row(order[k]));
-			}
-
-			if (g_cfg.fullTable) {
-				Line("Per-plugin table (load order; slot 0 = work inside LoadFiles but outside any plugin):");
-				Line(header);
-				for (std::uint32_t i = 0; i < n; ++i) {
-					Line(row(i));
-				}
-			}
-			Line("=====================================================================");
-			spdlog::default_logger()->flush();
-		}
+		LoadingMenuSink g_sink;
 
 		void TryReport(const char* a_trigger)
 		{
@@ -765,9 +945,11 @@ namespace lt::probe
 			if (!g_reported.compare_exchange_strong(expected, true)) {
 				return;
 			}
-			WriteReport(a_trigger);
-			g_state.store(kDone);  // every thunk is a pure pass-through from here on
-			spdlog::info("[probe] report written; all hooks are now pass-through for the rest of the session.");
+			WriteStartupReport(a_trigger);
+			g_state.store(kDone);  // the startup episode is finished
+			spdlog::info("[probe] startup report written.{}", g_grp[kRuntime].installed ?
+				" Runtime Loading Menu episodes are reported as they close." :
+				" No runtime episodes (off, or the sink is not registered); all hooks are idle pass-through now.");
 			spdlog::default_logger()->flush();
 		}
 	}
@@ -782,6 +964,13 @@ namespace lt::probe
 		g_grp[kRawRead].requested = a_config.rawRead;
 		g_grp[kInflate].requested = a_config.inflate;
 		g_grp[kPostLoop].requested = a_config.postLoop;
+		g_grp[kLfCallees].requested = a_config.lfCallees;
+		g_grp[kInitPass].requested = a_config.initPass;
+		g_grp[kPerForm].requested = a_config.perForm;
+		g_grp[kInitRefs].requested = a_config.initRefs;
+		g_grp[kLoopSplit].requested = a_config.loopSplit;
+		g_grp[kNewForms].requested = a_config.newForms;
+		g_grp[kRuntime].requested = a_config.runtimeEpisodes;
 
 		const auto inactive = [](std::string a_why) {
 			g_inactiveWhy = std::move(a_why);
@@ -834,7 +1023,16 @@ namespace lt::probe
 				return;
 			}
 		}
-		g_slots = std::make_unique<Slot[]>(kMaxSlots);  // preallocated: no allocation in any thunk
+
+		// Preallocated state: no allocation in any thunk.
+		ResolveOsFunctions();
+		g_eps = std::make_unique<Episode[]>(kMaxEpisodes);
+		g_eps[0].index = 0;
+		g_eps[0].startup = true;
+		g_eps[0].name = "startup";
+		g_blocks = std::make_unique<Block[]>(kMaxBlocks);
+		g_slots = std::make_unique<Slot[]>(kMaxSlots);
+		g_files = std::make_unique<FileRow[]>(kFileRows);
 
 		// ---- verify every other group before patching anything ----
 		std::array<std::uintptr_t, sites::kPerPluginSites.size()> perPluginAddrs{};
@@ -900,10 +1098,59 @@ namespace lt::probe
 			}
 		}
 
+		// ---- v2 E8 groups: all-or-nothing per owner ----
+		std::array<std::uintptr_t, kTimedCount> timedCallee{}, timedSite{};
+		const auto verifyOwner = [&](sites::Owner a_owner, Group a_g, bool a_requested) -> bool {
+			if (!a_requested) {
+				return false;
+			}
+			std::string w;
+			for (std::size_t i = 0; i < kTimedCount; ++i) {
+				const auto&    s = sites::kTimedSites[i];
+				std::uintptr_t actual = 0;
+				if (s.owner != a_owner) {
+					continue;
+				}
+				if (!CheckFn(s.callee, timedCallee[i], w) || !CheckCallSite(s.site, timedCallee[i], timedSite[i], actual, w)) {
+					Refuse(a_g, w);
+					return false;
+				}
+			}
+			return true;
+		};
+		const bool doLf = verifyOwner(sites::Owner::kLoadFiles, kLfCallees, a_config.lfCallees);
+		const bool doIp = verifyOwner(sites::Owner::kInitPass, kInitPass, a_config.initPass);
+		const bool doLoop = verifyOwner(sites::Owner::kPluginLoop, kLoopSplit, a_config.loopSplit);
+		const bool doNew = verifyOwner(sites::Owner::kRecord, kNewForms, a_config.newForms);
+
+		// ---- v2 virtual sites: all-or-nothing per group ----
+		std::array<std::uintptr_t, kVfCount> vfSite{};
+		const auto                           verifyVf = [&](Group a_g, bool a_requested) -> bool {
+            if (!a_requested) {
+                return false;
+            }
+            std::string w;
+            for (std::size_t i = 0; i < kVfCount; ++i) {
+                if (VfGroup(i) != a_g) {
+                    continue;
+                }
+                if (!CheckVfSite(sites::kVfSites[i], vfSite[i], w)) {
+                    Refuse(a_g, w);
+                    return false;
+                }
+            }
+            return true;
+		};
+		const bool doVfPass = verifyVf(kInitPass, a_config.initPass);
+		const bool doVfCore = verifyVf(kPerForm, a_config.perForm);
+		const bool doVfRefs = verifyVf(kInitRefs, a_config.initRefs);
+
 		// ---- patch. Originals are stored BEFORE each patch (the thunk can run the
 		// instant the E8 is rewritten) and are the VERIFIED targets. ----
-		// 9 distinct thunks x 14-byte stubs + a 19-byte gateway; 512 is headroom.
-		SKSE::AllocTrampoline(512);
+		// v1: 9 distinct thunks x 14-byte stubs + a 19-byte gateway. v2: up to 55 E8
+		// thunks (14 bytes each) + 10 virtual thunks (8-byte slots). 4 KiB is headroom
+		// (the validation doc asks for at least 2 KiB).
+		SKSE::AllocTrampoline(4096);
 		auto& tr = SKSE::GetTrampoline();
 
 		if (doPerPlugin) {
@@ -956,6 +1203,59 @@ namespace lt::probe
 			Patched(kPostLoop, 1);
 		}
 
+		const auto patchOwner = [&](sites::Owner a_owner, Group a_g) {
+			std::size_t n = 0;
+			for (std::size_t i = 0; i < kTimedCount; ++i) {
+				if (sites::kTimedSites[i].owner != a_owner) {
+					continue;
+				}
+				g_timedOrig[i] = timedCallee[i];
+				CheckPrev(a_g, tr.write_call<5>(timedSite[i], kTimedThunks[i]), timedCallee[i]);
+				++n;
+			}
+			Patched(a_g, n);
+		};
+		if (doLf) {
+			patchOwner(sites::Owner::kLoadFiles, kLfCallees);
+		}
+		if (doLoop) {
+			patchOwner(sites::Owner::kPluginLoop, kLoopSplit);
+		}
+		if (doNew) {
+			patchOwner(sites::Owner::kRecord, kNewForms);
+		}
+		// initPass = the 22 E8 rows AND its 5 virtual rows, all-or-nothing together.
+		const bool doInitPass = doIp && doVfPass;
+		if (doInitPass) {
+			patchOwner(sites::Owner::kInitPass, kInitPass);
+		}
+
+		// The 6-byte virtual sites. write_call<6>'s return value is garbage for these sites
+		// (it assumes the original was rip-relative); it is deliberately ignored.
+		const auto patchVf = [&](Group a_g) {
+			std::size_t n = 0;
+			for (std::size_t i = 0; i < kVfCount; ++i) {
+				if (VfGroup(i) != a_g) {
+					continue;
+				}
+				(void)tr.write_call<6>(vfSite[i], kVfThunks[i]);
+				++n;
+			}
+			// the group counter of kInitPass covers the E8 rows too: report the virtual rows added
+			g_grp[a_g].installed = true;
+			g_grp[a_g].sites += n;
+			spdlog::info("[install] {}: {} virtual-call site(s) patched.", kGroupNames[a_g], n);
+		};
+		if (doInitPass) {
+			patchVf(kInitPass);
+		}
+		if (doVfCore) {
+			patchVf(kPerForm);
+		}
+		if (doVfRefs) {
+			patchVf(kInitRefs);
+		}
+
 		// Gate last: nothing is measured until every other seat is in place.
 		g_origLoadFiles = gateActual;  // == aLoadFiles unless bAllowPatchedGate chained
 		g_state.store(kIdle);
@@ -972,10 +1272,22 @@ namespace lt::probe
 		g_dataLoadedTid.store(Tid());
 		g_dataLoadedSeen.store(true);  // seq_cst: pairs with LoadFilesThunk (Dekker)
 
+		// Runtime episodes: a read-only sink on the main thread (kDataLoaded is posted there).
+		if (g_gateInstalled && g_cfg.runtimeEpisodes && !g_grp[kRuntime].installed) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				ui->AddEventSink<RE::MenuOpenCloseEvent>(&g_sink);
+				g_grp[kRuntime].installed = true;
+				spdlog::info("[install] {} registered (menu 'Loading Menu'; up to {} episodes).", kGroupNames[kRuntime], kMaxRuntimeEpisodes);
+			} else {
+				g_grp[kRuntime].why = "RE::UI singleton not available at kDataLoaded";
+				spdlog::warn("[install] {} NOT registered: {}", kGroupNames[kRuntime], g_grp[kRuntime].why);
+			}
+		}
+
 		if (!g_gateInstalled) {
 			bool expected = false;
 			if (g_reported.compare_exchange_strong(expected, true)) {
-				WriteReport("kDataLoaded");
+				WriteStartupReport("kDataLoaded");
 			}
 			return;
 		}
@@ -984,7 +1296,7 @@ namespace lt::probe
 			if (g_state.compare_exchange_strong(st, kDone)) {
 				bool expected = false;
 				if (g_reported.compare_exchange_strong(expected, true)) {
-					WriteReport("kDataLoaded (startup LoadFiles never entered)");
+					WriteStartupReport("kDataLoaded (startup LoadFiles never entered)");
 				}
 				return;
 			}

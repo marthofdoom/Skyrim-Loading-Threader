@@ -62,6 +62,15 @@ namespace
 		c.rawRead = IniBool("Hooks", "bRawRead", c.rawRead);
 		c.inflate = IniBool("Hooks", "bInflate", c.inflate);
 		c.postLoop = IniBool("Hooks", "bPostLoop", c.postLoop);
+		c.lfCallees = IniBool("Hooks", "bLfCallees", c.lfCallees);
+		c.initPass = IniBool("Hooks", "bInitPass", c.initPass);
+		c.perForm = IniBool("Hooks", "bPerForm", c.perForm);
+		c.initRefs = IniBool("Hooks", "bInitRefs", c.initRefs);
+		c.loopSplit = IniBool("Hooks", "bLoopSplit", c.loopSplit);
+		c.newForms = IniBool("Hooks", "bNewForms", c.newForms);
+		c.runtimeEpisodes = IniBool("Episodes", "bRuntimeLoadScreens", c.runtimeEpisodes);
+		c.formDigest = IniBool("Oracle", "bFormDigest", c.formDigest);
+		c.csv = IniBool("Report", "bCsv", c.csv);
 		c.allowPatchedGate = IniBool("Advanced", "bAllowPatchedGate", c.allowPatchedGate);
 		c.topN = static_cast<int>(GetPrivateProfileIntA("Report", "iTopN", c.topN, kIni));
 		c.fullTable = IniBool("Report", "bFullTable", c.fullTable);
@@ -95,6 +104,10 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 				 "bInflate={} bPostLoop={} bAllowPatchedGate={} iTopN={} bFullTable={}",
 		kIni, iniFound ? "found" : "NOT FOUND (defaults)", cfg.enabled, cfg.verbose, cfg.perPlugin, cfg.record,
 		cfg.loadBody, cfg.rawRead, cfg.inflate, cfg.postLoop, cfg.allowPatchedGate, cfg.topN, cfg.fullTable);
+	spdlog::info("[config] v2: bLfCallees={} bInitPass={} bPerForm={} bInitRefs={} bLoopSplit={} bNewForms={} "
+				 "bRuntimeLoadScreens={} bFormDigest={} bCsv={}",
+		cfg.lfCallees, cfg.initPass, cfg.perForm, cfg.initRefs, cfg.loopSplit, cfg.newForms, cfg.runtimeEpisodes,
+		cfg.formDigest, cfg.csv);
 
 	// Install now: SKSE loads plugins before the engine starts the InitTES
 	// thread, so no hooked function can be running while we patch.

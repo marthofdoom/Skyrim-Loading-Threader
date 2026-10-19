@@ -13,6 +13,8 @@ find_package(CommonLibSSE CONFIG REQUIRED)
 add_commonlibsse_plugin(${PROJECT_NAME} SOURCES
     plugin.cpp
     Probe.cpp
+    Report.cpp
+    Oracle.cpp
 )
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
